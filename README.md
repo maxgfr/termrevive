@@ -70,6 +70,10 @@ termrevive uninstall
   boot. It starts each terminal if needed and closes its blank startup window.
   Installing it also applies `doctor --fix`.
 - Logs: `~/.local/state/termrevive/logs/`.
+- After a `brew upgrade`, macOS may refuse the agents' first runs
+  (`launchctl print gui/$UID/com.termrevive.save` shows
+  `OS_REASON_CODESIGNING`) until it re-checks the new binary: `termrevive
+  install` re-registers them at once.
 
 ## Agent skill
 
