@@ -88,8 +88,24 @@ fn install_one(label: &str, body: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The binary path the agents run. A Homebrew keg path
+/// (`<prefix>/Cellar/termrevive/<version>/bin/termrevive`) is swapped for its
+/// `<prefix>/bin` link, which survives `brew upgrade`.
+fn stable_exe(exe: &Path) -> PathBuf {
+    let s = exe.to_string_lossy();
+    if let Some((prefix, rest)) = s.split_once("/Cellar/")
+        && let Some(name) = rest.rsplit('/').next()
+    {
+        let link = Path::new(prefix).join("bin").join(name);
+        if link.exists() || cfg!(test) {
+            return link;
+        }
+    }
+    exe.to_path_buf()
+}
+
 pub fn install(auto_save: bool, auto_restore: bool, interval: u64) -> Result<Vec<PathBuf>> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = stable_exe(&std::env::current_exe()?.canonicalize()?);
     let logs = store::state_dir().join("logs");
     fs::create_dir_all(&logs)?;
     let mut done = Vec::new();
@@ -149,6 +165,20 @@ mod tests {
         assert!(p.contains(
             "<string>/bin/a&amp;b</string>\n\t\t<string>save</string>\n\t\t<string>--auto</string>"
         ));
+    }
+
+    #[test]
+    fn homebrew_kegs_resolve_to_the_bin_link() {
+        assert_eq!(
+            stable_exe(Path::new(
+                "/opt/homebrew/Cellar/termrevive/1.0.0/bin/termrevive"
+            )),
+            PathBuf::from("/opt/homebrew/bin/termrevive")
+        );
+        assert_eq!(
+            stable_exe(Path::new("/Users/me/.cargo/bin/termrevive")),
+            PathBuf::from("/Users/me/.cargo/bin/termrevive")
+        );
     }
 
     #[test]
