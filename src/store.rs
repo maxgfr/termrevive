@@ -26,7 +26,9 @@ pub fn latest_path() -> PathBuf {
 
 pub fn read(path: &Path) -> Result<Snapshot> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    serde_json::from_slice::<Snapshot>(&bytes)
+        .map(Snapshot::normalize)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 pub fn latest() -> Result<Option<Snapshot>> {

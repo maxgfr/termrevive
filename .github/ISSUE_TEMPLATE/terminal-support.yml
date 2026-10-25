@@ -1,0 +1,31 @@
+name: Terminal support request
+description: Ask for (or offer to add) support for another terminal emulator
+title: "Support <terminal>"
+labels: [terminal]
+body:
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and version
+      placeholder: WezTerm 20260101, Warp 0.2026…, Alacritty 0.15…
+    validations:
+      required: true
+  - type: textarea
+    id: api
+    attributes:
+      label: How can it be scripted?
+      description: >-
+        What reads its windows, tabs and panes (AppleScript dictionary, a CLI with JSON output, a socket…), and
+        whether it reports each pane's tty or shell pid. Links to its docs help.
+    validations:
+      required: true
+  - type: textarea
+    id: restore
+    attributes:
+      label: How can it open windows, tabs and splits in a directory and type text into them?
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to implement it (see CONTRIBUTING.md, "Adding a terminal")

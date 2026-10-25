@@ -1,6 +1,7 @@
 //! Ties the terminals a backend reports to the shell sessions found in the
-//! process table. Terminal scripting APIs (Ghostty's included) expose no tty or
-//! PID, so each pair is scored on title and cwd and assigned greedily.
+//! process table. A terminal that reports its panes' ttys is paired exactly;
+//! for the others (Ghostty exposes no tty or PID) each pair is scored on title
+//! and cwd and assigned greedily.
 
 use crate::backend::{RawLayout, RawTerminal};
 use crate::model::{Pane, Program, Tab, Window};
@@ -8,6 +9,7 @@ use crate::model::{Pane, Program, Tab, Window};
 /// What we know about one shell session from the process side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
+    pub tty: Option<String>,
     pub cwd: Option<String>,
     pub program: Option<Program>,
 }
@@ -56,21 +58,35 @@ pub fn assemble(layout: &RawLayout, candidates: Vec<Candidate>) -> Vec<Window> {
         .flat_map(|t| &t.terminals)
         .collect();
 
+    let mut by_terminal: Vec<Option<usize>> = vec![None; terminals.len()];
+    let mut used = vec![false; candidates.len()];
+    // Exact: same tty.
+    for (ti, t) in terminals.iter().enumerate() {
+        let Some(tty) = &t.tty else { continue };
+        if let Some(ci) =
+            (0..candidates.len()).find(|&ci| !used[ci] && candidates[ci].tty.as_ref() == Some(tty))
+        {
+            by_terminal[ti] = Some(ci);
+            used[ci] = true;
+        }
+    }
+
     let mut pairs: Vec<(u32, usize, usize)> = terminals
         .iter()
         .enumerate()
+        .filter(|(ti, _)| by_terminal[*ti].is_none())
         .flat_map(|(ti, t)| {
+            let used = &used;
             candidates
                 .iter()
                 .enumerate()
+                .filter(move |(ci, _)| !used[*ci])
                 .map(move |(ci, c)| (score(t, c), ti, ci))
         })
         .filter(|(s, _, _)| *s > 0)
         .collect();
     pairs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
-    let mut by_terminal: Vec<Option<usize>> = vec![None; terminals.len()];
-    let mut used = vec![false; candidates.len()];
     for (_, ti, ci) in pairs {
         if by_terminal[ti].is_none() && !used[ci] {
             by_terminal[ti] = Some(ci);
@@ -95,6 +111,7 @@ pub fn assemble(layout: &RawLayout, candidates: Vec<Candidate>) -> Vec<Window> {
         .windows
         .iter()
         .map(|w| Window {
+            backend: String::new(),
             orphans: false,
             tabs: w
                 .tabs
@@ -146,6 +163,7 @@ pub fn assemble(layout: &RawLayout, candidates: Vec<Candidate>) -> Vec<Window> {
         .collect();
     if !orphans.is_empty() {
         windows.push(Window {
+            backend: String::new(),
             tabs: orphans,
             orphans: true,
         });
@@ -164,11 +182,13 @@ mod tests {
             id: String::new(),
             title: title.into(),
             cwd: cwd.into(),
+            tty: None,
         }
     }
 
     fn claude(name: Option<&str>, sid: &str, cwd: &str) -> Candidate {
         Candidate {
+            tty: None,
             cwd: Some(cwd.into()),
             program: Some(Program {
                 name: "claude".into(),
@@ -236,6 +256,7 @@ mod tests {
             vec![term("~/tmp", "/tmp")],
         ]);
         let nvim = Candidate {
+            tty: None,
             cwd: Some("/src".into()),
             program: Some(Program {
                 name: "nvim".into(),
@@ -245,11 +266,13 @@ mod tests {
         };
         let c = vec![
             Candidate {
+                tty: None,
                 cwd: Some("/tmp".into()),
                 program: None,
             },
             nvim.clone(),
             Candidate {
+                tty: None,
                 cwd: Some("/src".into()),
                 program: None,
             },
@@ -268,6 +291,7 @@ mod tests {
             claude(Some("beta"), "B", "/d"),
             claude(Some("lost"), "L", "/x"),
             Candidate {
+                tty: None,
                 cwd: Some("/y".into()),
                 program: None,
             },
@@ -276,6 +300,30 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!(w[1].orphans);
         assert_eq!(session_ids(&w), vec!["B", "L"]);
+    }
+
+    #[test]
+    fn reported_ttys_pair_exactly_and_the_rest_by_score() {
+        // Same title and cwd everywhere: only the tty can tell them apart.
+        let mut a = term("✳ x", "/d");
+        a.tty = Some("ttys002".into());
+        let b = term("✳ x", "/d");
+        let mut c = term("✳ x", "/d");
+        c.tty = Some("ttys001".into());
+        let l = layout(vec![vec![a], vec![b], vec![c]]);
+        let on = |tty: &str, sid: &str| Candidate {
+            tty: Some(tty.into()),
+            ..claude(Some("x"), sid, "/d")
+        };
+        let w = assemble(
+            &l,
+            vec![
+                on("ttys001", "ONE"),
+                on("ttys002", "TWO"),
+                on("ttys003", "THREE"),
+            ],
+        );
+        assert_eq!(session_ids(&w), vec!["TWO", "THREE", "ONE"]);
     }
 
     #[test]

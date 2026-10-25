@@ -1,31 +1,21 @@
 //! Ghostty (macOS) through its AppleScript dictionary (Ghostty ≥ 1.3).
+//! Ghostty reports no tty: panes are paired with shells by score.
 
-use super::{Backend, RawLayout, RawTab, RawTerminal, RawWindow, Setting, WindowPlan};
+use super::applescript as osa;
+use super::conf::{self, Syntax};
+use super::{Backend, Caps, RawLayout, RawTab, RawTerminal, RawWindow, Setting, WindowPlan};
 use crate::procs::{self, Proc};
 use crate::rules::Launch;
-use anyhow::{Context, Result, bail};
-use std::fs;
-use std::io::Write;
+use anyhow::Result;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 pub struct Ghostty;
 
+const BUNDLE: &str = "com.mitchellh.ghostty";
 const EXE_SUFFIX: &str = "Ghostty.app/Contents/MacOS/ghostty";
-const US: char = '\u{1f}';
-const RS: char = '\u{1e}';
+const SAVE_STATE: &str = "window-save-state";
 
 const READ_SCRIPT: &str = r#"
-on txt(v)
-	try
-		if v is missing value then return ""
-		return v as text
-	on error
-		return ""
-	end try
-end txt
-
 set US to character id 31
 set RS to character id 30
 set out to ""
@@ -55,17 +45,11 @@ end tell
 return out
 "#;
 
-const SAVE_STATE: &str = "window-save-state";
-
 /// Ghostty's config files on macOS, in load order (a later one overrides).
 fn config_files() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
+    let (Some(xdg), Some(home)) = (conf::xdg_dir("ghostty"), dirs::home_dir()) else {
         return Vec::new();
     };
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("ghostty");
     let support = home.join("Library/Application Support/com.mitchellh.ghostty");
     vec![
         xdg.join("config"),
@@ -75,107 +59,9 @@ fn config_files() -> Vec<PathBuf> {
     ]
 }
 
-fn key_of(line: &str) -> Option<&str> {
-    let (k, _) = line.split_once('=')?;
-    let k = k.trim();
-    (!k.starts_with('#')).then_some(k)
-}
-
-/// Value of `key` across `files`, the last assignment winning.
-fn read_key(files: &[PathBuf], key: &str) -> Option<String> {
-    let mut value = None;
-    for text in files.iter().filter_map(|f| fs::read_to_string(f).ok()) {
-        for line in text.lines() {
-            if key_of(line) == Some(key) {
-                value = line.split_once('=').map(|(_, v)| v.trim().to_string());
-            }
-        }
-    }
-    value
-}
-
-/// `text` with every `key = …` line set to `value`, or one appended.
-fn set_key(text: &str, key: &str, value: &str) -> String {
-    let mut found = false;
-    let mut out: Vec<String> = text
-        .lines()
-        .map(|line| {
-            if key_of(line) == Some(key) {
-                found = true;
-                format!("{key} = {value}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    if !found {
-        if out.last().is_some_and(|l| !l.trim().is_empty()) {
-            out.push(String::new());
-        }
-        out.push("# Set by termrevive, which restores windows and programs itself.".into());
-        out.push(format!("{key} = {value}"));
-    }
-    out.join("\n") + "\n"
-}
-
-/// Sets `key` in the file that decides it: the last one assigning it, else the
-/// first existing file, else a new `files[0]`.
-fn write_key(files: &[PathBuf], key: &str, value: &str) -> Result<PathBuf> {
-    let assigns = |f: &&PathBuf| {
-        fs::read_to_string(f).is_ok_and(|t| t.lines().any(|l| key_of(l) == Some(key)))
-    };
-    let target = files
-        .iter()
-        .rev()
-        .find(assigns)
-        .or_else(|| files.iter().find(|f| f.exists()))
-        .or(files.first())
-        .context("no Ghostty config location")?
-        .clone();
-    let text = fs::read_to_string(&target).unwrap_or_default();
-    if let Some(dir) = target.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(&target, set_key(&text, key, value))
-        .with_context(|| format!("writing {}", target.display()))?;
-    Ok(target)
-}
-
-fn osascript(script: &str) -> Result<String> {
-    let mut child = Command::new("/usr/bin/osascript")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running osascript")?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(script.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("-1743") {
-            bail!(
-                "macOS refused to let termrevive control Ghostty. Allow it in System Settings → \
-                 Privacy & Security → Automation, then retry.\n{err}"
-            );
-        }
-        bail!("osascript failed: {}", err.trim());
-    }
-    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-    if s.ends_with('\n') {
-        s.pop();
-    }
-    Ok(s)
-}
-
 fn parse_layout(text: &str) -> RawLayout {
     let mut windows: Vec<RawWindow> = Vec::new();
-    for record in text.split(RS).filter(|r| !r.is_empty()) {
-        let f: Vec<&str> = record.split(US).collect();
+    for f in osa::records(text) {
         match f[0] {
             "W" => windows.push(RawWindow { tabs: Vec::new() }),
             "T" if f.len() >= 3 => {
@@ -193,6 +79,7 @@ fn parse_layout(text: &str) -> RawLayout {
                         id: f[1].to_string(),
                         title: f[2].to_string(),
                         cwd: f[3].to_string(),
+                        tty: None,
                     });
                 }
             }
@@ -202,21 +89,11 @@ fn parse_layout(text: &str) -> RawLayout {
     RawLayout { windows }
 }
 
-/// An AppleScript string expression for `s`.
-fn as_str(s: &str) -> String {
-    let body = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\r', "\" & return & \"")
-        .replace('\n', "\" & linefeed & \"");
-    format!("\"{body}\"")
-}
-
 fn surface_config(l: &Launch) -> String {
-    let mut fields = vec![format!("initial working directory:{}", as_str(&l.cwd))];
+    let mut fields = vec![format!("initial working directory:{}", osa::str(&l.cwd))];
     if let Some(input) = &l.input {
         let enter = if l.run { " & return" } else { "" };
-        fields.push(format!("initial input:{}{enter}", as_str(input)));
+        fields.push(format!("initial input:{}{enter}", osa::str(input)));
     }
     format!("{{{}}}", fields.join(", "))
 }
@@ -226,6 +103,18 @@ impl Backend for Ghostty {
         "ghostty"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Ghostty"
+    }
+
+    fn caps(&self) -> Caps {
+        Caps { splits: true }
+    }
+
+    fn installed(&self) -> bool {
+        osa::app_installed("Ghostty.app")
+    }
+
     fn host_pids(&self, procs: &[Proc]) -> Vec<i32> {
         procs::find_by_exe(procs, EXE_SUFFIX)
             .iter()
@@ -233,33 +122,22 @@ impl Backend for Ghostty {
             .collect()
     }
 
-    fn read_layout(&self) -> Result<RawLayout> {
-        Ok(parse_layout(&osascript(READ_SCRIPT)?))
+    fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
+        Ok(parse_layout(&osa::run(&format!(
+            "{}{READ_SCRIPT}",
+            osa::TXT_HANDLER
+        ))?))
     }
 
     fn ensure_running(&self) -> Result<()> {
-        let running = !self.host_pids(&procs::process_table()?).is_empty();
-        if !running {
-            let status = Command::new("/usr/bin/open")
-                .args(["-b", "com.mitchellh.ghostty"])
-                .status()
-                .context("launching Ghostty")?;
-            if !status.success() {
-                bail!("`open -b com.mitchellh.ghostty` failed");
-            }
+        if !self.running(&procs::process_table()?) {
+            osa::launch(BUNDLE)?;
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match osascript(r#"tell application "Ghostty" to count windows"#) {
-                Ok(_) => return Ok(()),
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(_) => std::thread::sleep(Duration::from_millis(500)),
-            }
-        }
+        osa::wait_ready(r#"tell application "Ghostty" to count windows"#)
     }
 
     fn blank_windows(&self) -> Result<Vec<String>> {
-        Ok(osascript(BLANK_SCRIPT)?
+        Ok(osa::run(BLANK_SCRIPT)?
             .lines()
             .filter(|l| !l.is_empty())
             .map(String::from)
@@ -275,15 +153,14 @@ impl Backend for Ghostty {
             .map(|id| {
                 format!(
                     "\ttry\n\t\tclose window (window id {})\n\tend try\n",
-                    as_str(id)
+                    osa::str(id)
                 )
             })
             .collect();
-        osascript(&format!("tell application \"Ghostty\"\n{body}end tell")).map(drop)
+        osa::run(&format!("tell application \"Ghostty\"\n{body}end tell")).map(drop)
     }
 
     fn restore_script(&self, window: &WindowPlan, delay_ms: u64) -> String {
-        let pause = format!("\tdelay {:.3}\n", delay_ms as f64 / 1000.0);
         let mut s = String::from("tell application \"Ghostty\"\n");
         let mut selected = None;
         let mut have_window = false;
@@ -298,7 +175,7 @@ impl Backend for Ghostty {
                     surface_config(first)
                 );
             } else {
-                s += &pause;
+                s += &osa::delay(delay_ms);
                 s += &format!(
                     "\tset t{ti} to new tab in w with configuration {}\n",
                     surface_config(first)
@@ -306,7 +183,7 @@ impl Backend for Ghostty {
             }
             s += &format!("\tset p to terminal 1 of t{ti}\n");
             for pane in rest {
-                s += &pause;
+                s += &osa::delay(delay_ms);
                 s += &format!(
                     "\tset p to split p direction right with configuration {}\n",
                     surface_config(pane)
@@ -327,20 +204,27 @@ impl Backend for Ghostty {
         if window.tabs.iter().all(|t| t.panes.is_empty()) {
             return Ok(());
         }
-        osascript(&self.restore_script(window, delay_ms)).map(drop)
+        osa::run(&self.restore_script(window, delay_ms)).map(drop)
     }
 
     fn settings(&self) -> Vec<Setting> {
+        let current = conf::read_key(&config_files(), SAVE_STATE, Syntax::Equals);
         vec![Setting {
             name: SAVE_STATE,
-            current: read_key(&config_files(), SAVE_STATE),
+            ok: current.as_deref() == Some("never"),
+            current,
             wanted: "never",
             why: "Ghostty reopens its own windows at launch, on top of a restore",
         }]
     }
 
     fn apply_setting(&self, setting: &Setting) -> Result<PathBuf> {
-        write_key(&config_files(), setting.name, setting.wanted)
+        conf::write_key(
+            &config_files(),
+            setting.name,
+            setting.wanted,
+            Syntax::Equals,
+        )
     }
 }
 
@@ -348,6 +232,7 @@ impl Backend for Ghostty {
 mod tests {
     use super::*;
     use crate::backend::TabPlan;
+    use crate::backend::applescript::{RS, US};
 
     #[test]
     fn parses_read_script_output() {
@@ -362,51 +247,7 @@ mod tests {
         assert_eq!(l.windows[0].tabs[0].terminals[1].cwd, "/y");
         assert_eq!(l.windows[0].tabs[0].terminals[1].title, "");
         assert_eq!(l.windows[1].tabs[0].terminals[0].cwd, "");
-    }
-
-    #[test]
-    fn set_key_rewrites_or_appends() {
-        assert_eq!(
-            set_key(
-                "a = 1\nwindow-save-state = always\n# window-save-state = x\n",
-                SAVE_STATE,
-                "never"
-            ),
-            "a = 1\nwindow-save-state = never\n# window-save-state = x\n"
-        );
-        assert_eq!(
-            set_key("a = 1\n", SAVE_STATE, "never"),
-            "a = 1\n\n# Set by termrevive, which restores windows and programs itself.\nwindow-save-state = never\n"
-        );
-        assert!(set_key("", SAVE_STATE, "never").starts_with("# Set by termrevive"));
-    }
-
-    #[test]
-    fn write_key_targets_the_deciding_file() {
-        let dir = std::env::temp_dir().join(format!("termrevive-ghostty-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let files = [dir.join("a/config"), dir.join("b/config")];
-        // Nothing exists: a new first file.
-        assert_eq!(write_key(&files, SAVE_STATE, "never").unwrap(), files[0]);
-        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("never"));
-        // A later file overrides it: that one gets rewritten.
-        fs::create_dir_all(files[1].parent().unwrap()).unwrap();
-        fs::write(&files[1], "font-size = 13\nwindow-save-state = always\n").unwrap();
-        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("always"));
-        assert_eq!(write_key(&files, SAVE_STATE, "never").unwrap(), files[1]);
-        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("never"));
-        assert!(
-            fs::read_to_string(&files[1])
-                .unwrap()
-                .starts_with("font-size = 13\n")
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn escapes_applescript_strings() {
-        assert_eq!(as_str(r#"a"b\c"#), r#""a\"b\\c""#);
-        assert_eq!(as_str("x\ny"), "\"x\" & linefeed & \"y\"");
+        assert_eq!(l.windows[1].tabs[0].terminals[0].tty, None);
     }
 
     #[test]
