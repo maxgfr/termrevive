@@ -74,10 +74,26 @@ fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+fn loaded(label: &str) -> bool {
+    Command::new("/bin/launchctl")
+        .args(["print", &format!("{}/{label}", domain())])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Unloads `label` and waits until launchd has let go of it: `bootout`
+/// returns while a running job is still stopping, and bootstrapping the same
+/// label meanwhile fails with "Bootstrap failed: 5".
 fn bootout(label: &str) {
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &format!("{}/{label}", domain())])
         .output();
+    for _ in 0..50 {
+        if !loaded(label) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn install_one(label: &str, body: &str) -> Result<PathBuf> {
