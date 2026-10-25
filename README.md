@@ -55,25 +55,30 @@ terminal only.
 ### Automatic (optional)
 
 ```sh
-termrevive install                 # both agents
-termrevive install --auto-save     # save every 2 min (--interval to change)
-termrevive install --auto-restore  # restore once at login
+termrevive install                 # restore at login, then save every 2 min
+termrevive install --auto-save     # save only (--interval to change the period)
+termrevive install --auto-restore  # restore only
 termrevive uninstall
 ```
 
+`install` sets up one LaunchAgent, `com.termrevive.agent`: a single process
+started at login, which restores and then saves in a loop. macOS shows its
+"background activity" notification once, when it is installed — not on every
+save (agents of termrevive ≤ 1.2 were relaunched every 2 minutes and could
+trigger it each time; `install` replaces them).
+
 - Auto-save writes only when something changed, never while a restore runs,
-  never when no terminal runs, and — when auto-restore is installed — not after
-  a reboot until that boot's restore has happened, so a fresh empty terminal
+  never when no terminal runs, and — when auto-restore is on — not after a
+  reboot until that boot's restore has happened, so a fresh empty terminal
   can't overwrite the snapshot you want back. A terminal that runs but cannot
   be read keeps its windows from the previous snapshot.
 - Auto-restore runs at login, only from a snapshot of a previous boot, once per
   boot. It starts each terminal if needed and closes its blank startup window.
   Installing it also applies `doctor --fix`.
-- Logs: `~/.local/state/termrevive/logs/`.
-- After a `brew upgrade`, macOS may refuse the agents' first runs
-  (`launchctl print gui/$UID/com.termrevive.save` shows
-  `OS_REASON_CODESIGNING`) until it re-checks the new binary: `termrevive
-  install` re-registers them at once.
+- Log: `~/.local/state/termrevive/logs/agent.log`.
+- After a `brew upgrade`, run `termrevive install` again: the agent keeps
+  running the previous binary until then, and macOS may refuse its next launch
+  (`OS_REASON_CODESIGNING`) until it is re-registered.
 
 ## Agent skill
 

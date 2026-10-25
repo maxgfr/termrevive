@@ -31,7 +31,7 @@ Panes open one after another (`delay_ms` in the config, 300 ms by default), so a
 
 ## Automatic mode
 
-`termrevive install` adds two LaunchAgents: a save every 2 minutes (`--interval` to change, `--auto-save` alone) and a restore at login (`--auto-restore` alone), which also applies `doctor --fix`. Auto-save skips while Ghostty is closed or empty, while a restore runs, and after a reboot until that boot's restore happened, so an empty Ghostty never overwrites the snapshot to restore. These change the user's login items and Ghostty config: ask before running `install` or `uninstall`. Logs are in `~/.local/state/termrevive/logs/`.
+`termrevive install` adds one LaunchAgent, started at login: it restores (`--auto-restore` alone; this also applies `doctor --fix`), then saves every 2 minutes (`--interval` to change, `--auto-save` alone). Auto-save skips while no terminal runs or all are empty, while a restore runs, and after a reboot until that boot's restore happened, so an empty terminal never overwrites the snapshot to restore. These change the user's login items and Ghostty config: ask before running `install` or `uninstall`. The log is `~/.local/state/termrevive/logs/agent.log`. After a `brew upgrade`, the agent must be reinstalled (`termrevive install`).
 
 ## Tune what gets relaunched
 
