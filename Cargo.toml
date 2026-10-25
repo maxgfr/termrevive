@@ -1,6 +1,6 @@
 [package]
 name = "termrevive"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Save and restore terminal sessions (windows, tabs, splits, running programs) across reboots"
 license = "MIT"
