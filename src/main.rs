@@ -193,6 +193,22 @@ fn summary(s: &Snapshot) -> String {
     )
 }
 
+/// Equal up to the status glyphs programs put in titles (Claude Code's spinner
+/// changes them every few seconds), so auto-save does not rewrite on every tick.
+fn same_layout(a: &[model::Window], b: &[model::Window]) -> bool {
+    let norm = |ws: &[model::Window]| {
+        let mut ws = ws.to_vec();
+        for t in ws.iter_mut().flat_map(|w| &mut w.tabs) {
+            t.title = matcher::strip_title(&t.title).to_string();
+            for p in &mut t.panes {
+                p.title = matcher::strip_title(&p.title).to_string();
+            }
+        }
+        ws
+    };
+    norm(a) == norm(b)
+}
+
 fn save(backend: &dyn Backend, auto: bool) -> Result<()> {
     if auto && store::RestoreLock::held() {
         log!("skip: a restore is running");
@@ -225,10 +241,9 @@ fn save(backend: &dyn Backend, auto: bool) -> Result<()> {
             log!("skip: waiting for the auto-restore of this boot");
             return Ok(());
         }
-        if latest
-            .as_ref()
-            .is_some_and(|l| l.windows == snap.windows && l.boot_time == snap.boot_time)
-        {
+        if latest.as_ref().is_some_and(|l| {
+            l.boot_time == snap.boot_time && same_layout(&l.windows, &snap.windows)
+        }) {
             return Ok(());
         }
     }
@@ -507,4 +522,38 @@ fn doctor(backend: &dyn Backend) -> Result<()> {
         _ => println!("[ok  ] config: built-in defaults"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{Pane, Tab, Window};
+
+    fn win(title: &str, cwd: &str) -> Vec<Window> {
+        vec![Window {
+            orphans: false,
+            tabs: vec![Tab {
+                title: title.into(),
+                selected: true,
+                panes: vec![Pane {
+                    title: title.into(),
+                    cwd: cwd.into(),
+                    program: None,
+                }],
+            }],
+        }]
+    }
+
+    #[test]
+    fn spinner_glyphs_do_not_count_as_changes() {
+        assert!(same_layout(
+            &win("✳ fix-bug", "/a"),
+            &win("◐ fix-bug", "/a")
+        ));
+        assert!(!same_layout(
+            &win("✳ fix-bug", "/a"),
+            &win("✳ fix-bug", "/b")
+        ));
+        assert!(!same_layout(&win("✳ fix-bug", "/a"), &win("✳ other", "/a")));
+    }
 }
