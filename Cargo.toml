@@ -1,6 +1,6 @@
 [package]
 name = "termrevive"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Save and restore terminal sessions (Ghostty, iTerm2, kitty, Terminal.app): windows, tabs, splits and running programs, across reboots"
 license = "MIT"
