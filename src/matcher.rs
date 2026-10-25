@@ -31,7 +31,7 @@ fn title_mentions(title: &str, name: &str) -> bool {
 fn score(t: &RawTerminal, c: &Candidate) -> u32 {
     let mut s = 0;
     if let Some(p) = &c.program {
-        if p.claude
+        if p.agent
             .as_ref()
             .and_then(|c| c.name.as_deref())
             .is_some_and(|n| strip_title(&t.title) == n)
@@ -146,7 +146,7 @@ pub fn assemble(layout: &RawLayout, candidates: Vec<Candidate>) -> Vec<Window> {
         .map(|(c, _)| {
             let p = c.program.clone().unwrap();
             let title = p
-                .claude
+                .agent
                 .as_ref()
                 .and_then(|c| c.name.clone())
                 .unwrap_or_else(|| p.name.clone());
@@ -175,7 +175,7 @@ pub fn assemble(layout: &RawLayout, candidates: Vec<Candidate>) -> Vec<Window> {
 mod tests {
     use super::*;
     use crate::backend::{RawTab, RawWindow};
-    use crate::model::ClaudeSession;
+    use crate::model::AgentSession;
 
     fn term(title: &str, cwd: &str) -> RawTerminal {
         RawTerminal {
@@ -193,11 +193,13 @@ mod tests {
             program: Some(Program {
                 name: "claude".into(),
                 argv: vec!["claude".into()],
-                claude: Some(ClaudeSession {
+                agent: Some(AgentSession {
+                    harness: "claude".into(),
                     session_id: sid.into(),
                     cwd: cwd.into(),
                     name: name.map(Into::into),
                 }),
+                ..Default::default()
             }),
         }
     }
@@ -225,7 +227,7 @@ mod tests {
             .map(|p| {
                 p.program
                     .as_ref()
-                    .and_then(|p| p.claude.as_ref())
+                    .and_then(|p| p.agent.as_ref())
                     .map(|c| c.session_id.clone())
                     .unwrap_or_else(|| "-".into())
             })
@@ -261,7 +263,7 @@ mod tests {
             program: Some(Program {
                 name: "nvim".into(),
                 argv: vec!["nvim".into(), "main.rs".into()],
-                claude: None,
+                ..Default::default()
             }),
         };
         let c = vec![

@@ -1,6 +1,6 @@
 mod backend;
 mod capture;
-mod claude;
+mod harness;
 mod launchd;
 mod matcher;
 mod model;
@@ -17,8 +17,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Save and restore terminal sessions: windows, tabs, splits, working
-/// directories and the programs running in them (Claude Code included), for
-/// Ghostty, iTerm2, kitty and Terminal.app.
+/// directories and the programs running in them, for Ghostty, iTerm2, kitty
+/// and Terminal.app. Agent CLIs resume their own session: Claude Code, Codex,
+/// Mistral Vibe, opencode and Kilo.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -222,12 +223,22 @@ fn agent(
 
 fn summary(s: &Snapshot) -> String {
     let terminals: Vec<String> = s.backends().iter().map(|b| display(b)).collect();
+    let counts = s.agent_counts();
+    let agents: Vec<String> = counts
+        .iter()
+        .map(|(h, n)| format!("{n} {}", harness::display(h)))
+        .collect();
     format!(
-        "{} window(s), {} tab(s), {} pane(s), {} Claude session(s){}",
+        "{} window(s), {} tab(s), {} pane(s), {} agent session(s){}{}",
         s.windows.len(),
         s.tab_count(),
         s.pane_count(),
-        s.claude_count(),
+        counts.iter().map(|(_, n)| n).sum::<usize>(),
+        if agents.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", agents.join(", "))
+        },
         if terminals.is_empty() {
             String::new()
         } else {

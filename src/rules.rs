@@ -5,14 +5,17 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_CONFIG: &str = r#"# termrevive configuration. Rules are tried top to bottom, your rules first,
-# then the built-in ones (unless builtin_rules = false). The first rule whose
-# `match` lists the foreground program and whose template can be filled wins.
+pub const DEFAULT_CONFIG: &str = r#"# termrevive configuration. Rules are tried top to bottom: your rules first,
+# then, for an agent CLI whose session was found (claude, codex, vibe, opencode,
+# kilo), its harness' own resume command, then the built-in rules (unless
+# builtin_rules = false), then [default]. The first rule whose `match` lists the
+# program (or the harness) and whose template can be filled wins.
 #
 # Template variables:
 #   {argv}               the saved command line, shell-quoted
 #   {cwd}                the pane's working directory
-#   {claude_session_id}  {claude_cwd}  {claude_name}   (Claude Code panes only)
+#   {session_id}  {session_cwd}  {session_name}   (agent sessions only)
+#   {claude_session_id}  {claude_cwd}  {claude_name}   (same, older names)
 #
 # run = true types the command and presses Enter; run = false only types it.
 
@@ -26,18 +29,17 @@ delay_ms = 300   # pause between two tabs/splits
 # command = "{argv}"
 # run = false
 
+# [[rule]]                       # resume Codex sessions in full-auto mode
+# match = "codex"
+# command = "codex resume {session_id} --full-auto"
+# cwd = "{session_cwd}"
+
 [default]        # any other program
 command = "{argv}"
 run = false
 "#;
 
 const BUILTIN_RULES: &str = r#"
-[[rule]]
-match = ["claude"]
-command = "claude --resume {claude_session_id}"
-cwd = "{claude_cwd}"
-run = true
-
 [[rule]]
 match = ["nvim", "vim", "vi", "hx", "emacs", "nano", "ssh", "mosh", "htop", "btop", "top", "less", "man", "lazygit", "tig", "k9s", "yazi"]
 command = "{argv}"
@@ -146,15 +148,14 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
-    fn all_rules(&self) -> impl Iterator<Item = Rule> + '_ {
-        let builtins = if self.builtin_rules {
+    fn builtins(&self) -> Vec<Rule> {
+        if self.builtin_rules {
             toml::from_str::<Builtins>(BUILTIN_RULES)
                 .expect("built-in rules parse")
                 .rule
         } else {
             Vec::new()
-        };
-        self.rules.iter().cloned().chain(builtins)
+        }
     }
 
     /// How to bring `pane` back.
@@ -179,24 +180,34 @@ impl Config {
         let Some(program) = &pane.program else {
             return base;
         };
-        for rule in self.all_rules() {
-            if !rule.matches.contains(&program.name) {
-                continue;
-            }
-            let Some(cmd) = render(&rule.command, pane) else {
-                continue;
-            };
-            let cwd = rule
-                .cwd
-                .as_deref()
-                .and_then(|c| render(c, pane))
+        let session_cwd = || {
+            program
+                .agent
+                .as_ref()
+                .map(|a| a.cwd.clone())
                 .filter(|c| Path::new(c).is_dir())
-                .unwrap_or(base.cwd);
+                .unwrap_or_else(|| base.cwd.clone())
+        };
+        // Your rules first.
+        for rule in &self.rules {
+            if let Some(l) = self.apply(rule, pane, &base.cwd) {
+                return l;
+            }
+        }
+        // Then the harness' own way to resume the session it found.
+        if let Some(agent) = &program.agent
+            && let Some(h) = crate::harness::by_name(&agent.harness)
+        {
             return Launch {
-                cwd,
-                input: (!cmd.is_empty()).then_some(cmd),
-                run: rule.run,
+                cwd: session_cwd(),
+                input: Some(h.resume_command(agent)),
+                run: true,
             };
+        }
+        for rule in self.builtins() {
+            if let Some(l) = self.apply(&rule, pane, &base.cwd) {
+                return l;
+            }
         }
         let cmd = render(&self.default.command, pane).filter(|c| !c.is_empty());
         Launch {
@@ -204,6 +215,30 @@ impl Config {
             run: self.default.run,
             ..base
         }
+    }
+
+    /// `rule` applied to `pane`, if it matches the program (or its harness)
+    /// and its templates can be filled.
+    fn apply(&self, rule: &Rule, pane: &Pane, fallback_cwd: &str) -> Option<Launch> {
+        let program = pane.program.as_ref()?;
+        let harness = program.agent.as_ref().map(|a| a.harness.as_str());
+        if !rule.matches.contains(&program.name)
+            && !harness.is_some_and(|h| rule.matches.contains(h))
+        {
+            return None;
+        }
+        let cmd = render(&rule.command, pane)?;
+        let cwd = rule
+            .cwd
+            .as_deref()
+            .and_then(|c| render(c, pane))
+            .filter(|c| Path::new(c).is_dir())
+            .unwrap_or_else(|| fallback_cwd.to_string());
+        Some(Launch {
+            cwd,
+            input: (!cmd.is_empty()).then_some(cmd),
+            run: rule.run,
+        })
     }
 }
 
@@ -219,7 +254,7 @@ pub struct Launch {
 /// Fills `{var}` placeholders; `None` if one is unknown or unavailable.
 fn render(template: &str, pane: &Pane) -> Option<String> {
     let program = pane.program.as_ref();
-    let claude = program.and_then(|p| p.claude.as_ref());
+    let agent = program.and_then(|p| p.agent.as_ref());
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find('{') {
@@ -233,9 +268,9 @@ fn render(template: &str, pane: &Pane) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(" "),
             "cwd" => shell_quote(&pane.cwd),
-            "claude_session_id" => claude?.session_id.clone(),
-            "claude_cwd" => claude?.cwd.clone(),
-            "claude_name" => shell_quote(claude?.name.as_deref()?),
+            "session_id" | "claude_session_id" => shell_quote(&agent?.session_id),
+            "session_cwd" | "claude_cwd" => agent?.cwd.clone(),
+            "session_name" | "claude_name" => shell_quote(agent?.name.as_deref()?),
             _ => return None,
         };
         out.push_str(&value);
@@ -257,36 +292,75 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ClaudeSession, Program};
+    use crate::model::{AgentSession, Program};
 
-    fn pane(name: &str, argv: &[&str], claude: Option<ClaudeSession>) -> Pane {
+    fn pane(name: &str, argv: &[&str], agent: Option<AgentSession>) -> Pane {
         Pane {
             title: String::new(),
             cwd: "/".into(),
             program: Some(Program {
                 name: name.into(),
                 argv: argv.iter().map(|s| s.to_string()).collect(),
-                claude,
+                agent,
+                ..Default::default()
             }),
         }
+    }
+
+    fn session(harness: &str, id: &str, cwd: &str) -> Option<AgentSession> {
+        Some(AgentSession {
+            harness: harness.into(),
+            session_id: id.into(),
+            cwd: cwd.into(),
+            name: None,
+        })
     }
 
     #[test]
     fn claude_resumes_in_its_session_cwd() {
         let tmp = std::env::temp_dir().display().to_string();
-        let p = pane(
-            "claude",
-            &["claude"],
-            Some(ClaudeSession {
-                session_id: "abc".into(),
-                cwd: tmp.clone(),
-                name: None,
-            }),
-        );
+        let p = pane("claude", &["claude"], session("claude", "abc", &tmp));
         let l = Config::default().launch(&p);
         assert_eq!(l.input.as_deref(), Some("claude --resume abc"));
         assert_eq!(l.cwd, tmp);
         assert!(l.run);
+    }
+
+    #[test]
+    fn every_harness_resumes_its_own_way() {
+        let cases = [
+            ("codex", "codex resume 019a"),
+            ("vibe", "vibe --resume 019a"),
+            ("opencode", "opencode --session 019a"),
+            ("kilo", "kilo --session 019a"),
+        ];
+        for (h, want) in cases {
+            let l = Config::default().launch(&pane(h, &[h], session(h, "019a", "/nope")));
+            assert_eq!(l.input.as_deref(), Some(want));
+            assert!(l.run);
+            assert_eq!(l.cwd, "/", "missing session dir falls back to the pane's");
+        }
+    }
+
+    #[test]
+    fn user_rules_can_override_a_harness_by_name() {
+        let cfg: Config = toml::from_str(
+            "[[rule]]\nmatch = \"codex\"\ncommand = \"codex resume {session_id} --full-auto\"\n",
+        )
+        .unwrap();
+        // The program is a wrapper; the harness name still matches.
+        let l = cfg.launch(&pane(
+            "codexfeine",
+            &["codexfeine"],
+            session("codex", "x y", "/"),
+        ));
+        assert_eq!(l.input.as_deref(), Some("codex resume 'x y' --full-auto"));
+        let legacy: Config = toml::from_str(
+            "[[rule]]\nmatch = \"claude\"\ncommand = \"claude -r {claude_session_id}\"\n",
+        )
+        .unwrap();
+        let l = legacy.launch(&pane("claude", &["claude"], session("claude", "abc", "/")));
+        assert_eq!(l.input.as_deref(), Some("claude -r abc"));
     }
 
     #[test]

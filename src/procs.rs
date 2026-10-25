@@ -208,6 +208,16 @@ fn parse_procargs(buf: &[u8]) -> Option<Vec<String>> {
     (args.len() == argc && argc > 0).then_some(args)
 }
 
+/// Seconds since the epoch at which `pid` started.
+pub fn start_time(pid: i32) -> Option<i64> {
+    // SAFETY: zeroed is a valid proc_bsdinfo; proc_pidinfo writes at most `size` bytes.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some(info.pbi_start_tvsec as i64)
+}
+
 /// Seconds since the epoch at which the machine booted.
 pub fn boot_time() -> i64 {
     let mut tv = libc::timeval {
@@ -299,5 +309,7 @@ mod tests {
     fn own_argv_is_readable() {
         assert!(argv(std::process::id() as i32).is_some_and(|a| !a.is_empty()));
         assert!(boot_time() > 0);
+        let me = start_time(std::process::id() as i32).unwrap();
+        assert!(me >= boot_time() && me <= chrono::Local::now().timestamp());
     }
 }
