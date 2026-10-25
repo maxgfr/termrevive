@@ -2,9 +2,12 @@
 
 Save your terminal sessions and get them back after a reboot: windows, tabs,
 splits, working directories **and the programs that were running** — every
-Claude Code session resumes its own conversation (`claude --resume <id>`, in the
-worktree it was in), editors and `ssh` reopen, unknown commands are typed back
-without being run.
+coding agent resumes its own conversation (Claude Code, Codex, Mistral Vibe,
+opencode, Kilo, in the directory or worktree it was in), editors and `ssh`
+reopen, unknown commands are typed back without being run.
+
+Both sides are pluggable: terminals (*backends*) and agent CLIs (*harnesses*)
+are one file each — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Supported terminals (macOS)
 
@@ -19,6 +22,23 @@ One snapshot holds every terminal that runs; `--backend <name>` (`ghostty`,
 `iterm2`, `kitty`, `terminal`) restricts any command to one of them. Missing
 yours? Adding a terminal is one file — see [CONTRIBUTING.md](CONTRIBUTING.md),
 or open a *Terminal support request* issue.
+
+## Supported coding agents
+
+| Harness | How the running session is found | Resumed with |
+| --- | --- | --- |
+| **Claude Code** | `~/.claude/sessions/<pid>.json`, registered by the CLI itself | `claude --resume <id>` |
+| **Codex** | active threads (`~/.codex/thread-writer-locks`), matched by directory and start time in their rollout | `codex resume <id>` |
+| **Mistral Vibe** | `~/.vibe/logs/session/active/*.lock.json`, held by a process on the pane's tty | `vibe --resume <id>` |
+| **opencode** | its SQLite database (`session_v2`/`session`): top-level sessions of the directory active since the CLI started | `opencode --session <id>` |
+| **Kilo** | same as opencode, in `~/.local/share/kilo/kilo.db` | `kilo --session <id>` |
+
+The commands are typed in your shell, so aliases and wrappers apply
+(`codex=codexfeine`…). An agent whose session can't be found yet (started, no
+prompt sent) comes back as its command line, typed but not run. Your own
+`[[rule]]` can change any of them (`match = "codex"`, `{session_id}`). Missing
+an agent? Adding a harness is one file — see [CONTRIBUTING.md](CONTRIBUTING.md),
+or open an *Agent support request* issue.
 
 ## Install
 
@@ -111,22 +131,25 @@ command = "{argv}"
 run = false
 ```
 
-Your rules come first, then the built-ins (`builtin_rules = false` to drop them):
-`claude` → `claude --resume {claude_session_id}` in `{claude_cwd}`; editors,
-pagers, `ssh`, `htop`, `lazygit`… → rerun `{argv}`. Variables: `{argv}`, `{cwd}`,
-`{claude_session_id}`, `{claude_cwd}`, `{claude_name}`. Commands are typed in
-your interactive shell, so aliases (`claude=…`) apply.
+Your rules come first (matched on the program or on the harness name), then
+each harness's resume command for agent sessions, then the built-ins
+(`builtin_rules = false` to drop them): editors, pagers, `ssh`, `htop`,
+`lazygit`… → rerun `{argv}`. Variables: `{argv}`, `{cwd}`, `{session_id}`,
+`{session_cwd}`, `{session_name}` (`{claude_session_id}`, `{claude_cwd}`,
+`{claude_name}` still work). Commands are typed in your interactive shell, so
+aliases (`claude=…`) apply.
 
 ## How it works
 
 Each terminal's scripting interface (AppleScript, or `kitten @` for kitty) lists
 windows → tabs → panes. termrevive reads the process table (shell and
-foreground job of each tty, exact argv via `KERN_PROCARGS2`, cwd via `lsof`) and
-Claude Code's `~/.claude/sessions/*.json`, then pairs every pane with its shell:
-exactly when the terminal reports the pane's tty (iTerm2, Terminal.app) or
-shell pid (kitty), by score otherwise (Ghostty: Claude session name in the
-title, program name in the title, same cwd). Anything it can't place is still
-saved, in an extra "orphans" window.
+foreground job of each tty, exact argv via `KERN_PROCARGS2`, cwd via `lsof`),
+asks each harness whether one of a pane's processes is its CLI and which
+session it works on, then pairs every pane with its shell: exactly when the
+terminal reports the pane's tty (iTerm2, Terminal.app) or shell pid (kitty), by
+score otherwise (Ghostty: agent session name in the title, program name in the
+title, same cwd). Anything it can't place is still saved, in an extra
+"orphans" window.
 
 ## Limits
 
@@ -135,5 +158,7 @@ saved, in an extra "orphans" window.
 - Terminal.app's AppleScript shows each tab as a window and cannot open tabs, so
   its tabs come back as separate windows.
 - A program's in-memory state is not saved (unless the program itself resumes,
-  like Claude Code).
+  like the coding agents above).
+- Codex, opencode and Kilo don't record which CLI process owns a session, so
+  several of them in the same directory are told apart by start time.
 - macOS only for now.

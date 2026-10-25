@@ -49,6 +49,42 @@ LaunchAgents, `doctor` — is shared and needs no change.
          startup window.
    - [ ] `termrevive doctor` and `doctor --fix`.
 
+## Adding a coding agent (harness)
+
+A harness is one module in `src/harness/` implementing the `Harness` trait
+(`src/harness/mod.rs`): it recognizes its CLI among a pane's processes, finds
+the session that process works on, and says how to resume it. Capture, pairing,
+rules (`match = "<name>"`, `{session_id}`), snapshots and restore are shared.
+
+1. **Find how a running CLI maps to its session.** Start a throwaway session
+   and look at what the agent writes while it runs:
+   - a registry keyed by pid (`~/.claude/sessions/<pid>.json`, Vibe's
+     `active/*.lock.json`) is exact — see `claude.rs`, `vibe.rs`;
+   - otherwise, sessions that are active or recently updated, matched by the
+     process' directory and start time — see `codex.rs` (files) and
+     `sqlite.rs` (an SQLite database, read with macOS' `sqlite3`).
+   `AgentProc` gives you the pid, tty, argv, cwd and start time; the whole
+   process table is there too, for helpers that run beside the CLI.
+2. **Implement the trait.**
+   - `is_cli`: the interactive CLI only — not its daemon, MCP server or one-shot
+     subcommands.
+   - `sessions`: candidates, likeliest first. Several CLIs of one harness in a
+     pane each get a different session: capture hands out each id once.
+   - `resume_command`: what to type in the pane's shell (quote ids with
+     `rules::shell_quote`).
+   - Honor the agent's own home override (`CODEX_HOME`, `VIBE_HOME`…) through
+     `home_dir_from` / `xdg_data`.
+3. **Register it**: one line in `registry()` in `src/harness/mod.rs`.
+4. **Test it** with fixtures in a temp dir (session files, a small SQLite
+   database): which session a process gets, that stale or foreign sessions are
+   ignored, the resume command, and that non-interactive processes are not
+   taken for the CLI.
+5. **Document it**: a row in the README "Supported coding agents" table.
+6. **Check it for real**:
+   - [ ] Two panes running the agent (send a prompt in each), `termrevive save`
+         then `show`: each pane shows `run <resume command>` with its own id.
+   - [ ] Close them, `termrevive restore`: each agent reopens its conversation.
+
 ## Checks
 
 ```sh

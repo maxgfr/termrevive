@@ -1,0 +1,34 @@
+name: Agent support request
+description: Ask for (or offer to add) resuming another coding agent's sessions
+title: "Resume <agent> sessions"
+labels: [harness]
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Agent CLI and version
+      placeholder: Gemini CLI 1.x, Cursor Agent 2026.x, Aider 0.9x…
+    validations:
+      required: true
+  - type: input
+    id: resume
+    attributes:
+      label: Command that resumes a session by id
+      placeholder: gemini --resume <id>
+    validations:
+      required: true
+  - type: textarea
+    id: storage
+    attributes:
+      label: Where does it keep sessions while it runs?
+      description: >-
+        Files or databases it writes (paths), and whether anything ties a session to the running process (a pid,
+        a lock file, the working directory, a start time).
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to implement it (see CONTRIBUTING.md, "Adding a coding agent")
