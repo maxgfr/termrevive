@@ -1,0 +1,30 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+    ["@semantic-release/release-notes-generator", { "preset": "conventionalcommits" }],
+    [
+      "@semantic-release/exec",
+      {
+        "verifyReleaseCmd": "if [ -n \"$EXPECTED_VERSION\" ]; then [ \"$EXPECTED_VERSION\" = \"${nextRelease.version}\" ] || { echo \"built $EXPECTED_VERSION but would release ${nextRelease.version}\" >&2; exit 1; }; elif [ -n \"$GITHUB_OUTPUT\" ]; then echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\"; fi",
+        "prepareCmd": "scripts/set-version.sh ${nextRelease.version} && scripts/release-commit.sh ${nextRelease.version}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "assets": [
+          { "path": "dist/termrevive-aarch64-apple-darwin", "name": "termrevive-aarch64-apple-darwin" },
+          { "path": "dist/termrevive-x86_64-apple-darwin", "name": "termrevive-x86_64-apple-darwin" },
+          { "path": "dist/SHA256SUMS", "name": "SHA256SUMS" }
+        ],
+        "releaseNameTemplate": "termrevive <%= nextRelease.version %>",
+        "releaseBodyTemplate": "<%= nextRelease.notes %>\n\nPrebuilt `termrevive` binaries for macOS (arm64, x86_64). Install with Homebrew: `brew install maxgfr/tap/termrevive`, or download the binary for your Mac, check it against SHA256SUMS and its build provenance (`gh attestation verify termrevive-<target> --repo maxgfr/termrevive`).",
+        "successComment": false,
+        "failComment": false,
+        "releasedLabels": false
+      }
+    ]
+  ]
+}

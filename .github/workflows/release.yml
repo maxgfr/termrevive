@@ -1,0 +1,147 @@
+name: Release
+# On every push to main: CI again, then semantic-release reads the conventional commits since the last v* tag.
+# A fix, feat, perf or breaking change releases a new version: tag v<version>, a GitHub-signed release commit,
+# the two macOS binaries and the SHA256SUMS that the Homebrew tap downloads, with build provenance.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.99.0
+  SEMANTIC_RELEASE: >-
+    npx --yes
+    -p semantic-release@25.0.9
+    -p @semantic-release/exec@7.1.0
+    -p @semantic-release/github@12.0.10
+    -p conventional-changelog-conventionalcommits@9.3.1
+    semantic-release
+jobs:
+  ci:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Next version
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      # semantic-release checks it could push to main, even in a dry run.
+      contents: write
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - id: next
+        name: Resolve the next release without publishing
+        env:
+          # GITHUB_TOKEN, not GH_TOKEN: semantic-release only adds the x-access-token: prefix
+          # that git needs for this token to GITHUB_TOKEN.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: $SEMANTIC_RELEASE --dry-run
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    if: needs.version.outputs.version != ''
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          # Cross-compiled on Apple silicon; Rosetta runs it for the checks below.
+          - { target: x86_64-apple-darwin, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      # No build cache here: a release binary is compiled from a clean slate.
+      - name: Set the resolved version before compilation
+        run: scripts/set-version.sh "$VERSION"
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Check the binary reports the release version
+        run: |
+          out=$("target/$TARGET/release/termrevive" --version)
+          echo "$out"
+          test "$out" = "termrevive $VERSION" || { echo "the binary reports '$out', expected 'termrevive $VERSION'" >&2; exit 1; }
+      - name: Smoke test against an empty state directory
+        run: |
+          state=$(mktemp -d)
+          out=$(XDG_STATE_HOME="$state" "target/$TARGET/release/termrevive" list)
+          echo "$out"
+          test "$out" = "no snapshot yet"
+      - name: Stage the binary
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/termrevive" "dist/termrevive-$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: termrevive-${{ matrix.target }}
+          path: dist/termrevive-${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      # The signed release commit, the tag and the GitHub release.
+      contents: write
+      # Build provenance: an OIDC token to sign the attestation and the right to store it.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: termrevive-*
+          path: dist
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          chmod +x termrevive-*
+          test "$(find . -maxdepth 1 -name 'termrevive-*' | wc -l)" -eq 2
+          sha256sum termrevive-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/termrevive-*
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Refuse publishing an outdated branch head
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BUILD_SHA"
+      # Stamps the version, commits it to main through the API (signed by GitHub), tags it and publishes the
+      # release. Commits and tags pushed with GITHUB_TOKEN trigger no workflow, so this does not loop.
+      - name: Release versioned binaries and checksums
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: $SEMANTIC_RELEASE
