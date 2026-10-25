@@ -61,7 +61,8 @@ enum Cmd {
     },
     /// List saved snapshots, newest first.
     List,
-    /// Install the LaunchAgents (both when no flag is given).
+    /// Install the LaunchAgents (both when no flag is given). With auto-restore,
+    /// also sets the terminal settings a restore needs (see `doctor --fix`).
     Install {
         #[arg(long)]
         auto_save: bool,
@@ -79,8 +80,16 @@ enum Cmd {
         init: bool,
     },
     /// Check permissions, terminal settings and installed agents.
-    Doctor,
+    Doctor {
+        /// Set the terminal settings restores need (Ghostty: window-save-state = never).
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Print the agent skill (also installable with `npx skills add maxgfr/termrevive`).
+    Skill,
 }
+
+const SKILL: &str = include_str!("../skills/termrevive/SKILL.md");
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -118,6 +127,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("installed {}", p.display());
             }
             println!("logs: {}", store::state_dir().join("logs").display());
+            if auto_restore || both {
+                fix_settings(backend.as_ref())?;
+            }
             Ok(())
         }
         Cmd::Uninstall => {
@@ -127,7 +139,16 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Config { init } => config(init),
-        Cmd::Doctor => doctor(backend.as_ref()),
+        Cmd::Doctor { fix } => {
+            if fix {
+                fix_settings(backend.as_ref())?;
+            }
+            doctor(backend.as_ref())
+        }
+        Cmd::Skill => {
+            print!("{SKILL}");
+            Ok(())
+        }
     }
 }
 
@@ -444,29 +465,20 @@ fn config(init: bool) -> Result<()> {
     Ok(())
 }
 
-/// `window-save-state` from Ghostty's config files, last one wins.
-fn ghostty_window_save_state() -> Option<String> {
-    let home = dirs::home_dir()?;
-    let files = [
-        ".config/ghostty/config",
-        ".config/ghostty/config.ghostty",
-        "Library/Application Support/com.mitchellh.ghostty/config",
-        "Library/Application Support/com.mitchellh.ghostty/config.ghostty",
-    ];
-    let mut value = None;
-    for f in files {
-        let Ok(text) = std::fs::read_to_string(home.join(f)) else {
-            continue;
-        };
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once('=')
-                && k.trim() == "window-save-state"
-            {
-                value = Some(v.trim().to_string());
-            }
-        }
+/// Writes every terminal setting restores depend on that is not set yet.
+fn fix_settings(backend: &dyn Backend) -> Result<()> {
+    for s in backend.settings().into_iter().filter(|s| !s.ok()) {
+        let path = backend.apply_setting(&s)?;
+        println!(
+            "set {} {} = {} in {} (was {})",
+            backend.name(),
+            s.name,
+            s.wanted,
+            path.display(),
+            s.current.as_deref().unwrap_or("default")
+        );
     }
-    value
+    Ok(())
 }
 
 fn doctor(backend: &dyn Backend) -> Result<()> {
@@ -482,19 +494,18 @@ fn doctor(backend: &dyn Backend) -> Result<()> {
             Err(e) => println!("[warn] automation access: {e:#}"),
         }
     }
-    if backend.name() == "ghostty" {
-        let wss = ghostty_window_save_state();
-        let never = wss.as_deref() == Some("never");
+    for s in backend.settings() {
+        let fix = if s.ok() {
+            String::new()
+        } else {
+            format!("  → {}; fix: `termrevive doctor --fix`", s.why)
+        };
         println!(
-            "[{}] ghostty window-save-state = {}{}",
-            ok(never),
-            wss.as_deref().unwrap_or("default"),
-            if never {
-                ""
-            } else {
-                "  → Ghostty reopens its own (empty) windows at launch, duplicating a restore; \
-                 add `window-save-state = never` to ~/.config/ghostty/config"
-            }
+            "[{}] {} {} = {}{fix}",
+            ok(s.ok()),
+            backend.name(),
+            s.name,
+            s.current.as_deref().unwrap_or("default"),
         );
     }
     for label in [launchd::SAVE_LABEL, launchd::RESTORE_LABEL] {
