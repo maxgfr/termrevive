@@ -62,8 +62,10 @@ enum Cmd {
     },
     /// List saved snapshots, newest first.
     List,
-    /// Install the LaunchAgents (both when no flag is given). With auto-restore,
-    /// also sets the terminal settings a restore needs (see `doctor --fix`).
+    /// Install the LaunchAgent: one process started at login that restores, then
+    /// saves every `--interval` seconds (both when no flag is given). With
+    /// auto-restore, also sets the terminal settings a restore needs (see
+    /// `doctor --fix`).
     Install {
         #[arg(long)]
         auto_save: bool,
@@ -73,8 +75,16 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         interval: u64,
     },
-    /// Remove the LaunchAgents.
+    /// Remove the LaunchAgent.
     Uninstall,
+    /// What the LaunchAgent runs: restore once (with --restore), then save
+    /// every --save-every seconds until stopped.
+    Agent {
+        #[arg(long)]
+        restore: bool,
+        #[arg(long)]
+        save_every: Option<u64>,
+    },
     /// Print the config file path; --init writes a commented default one.
     Config {
         #[arg(long)]
@@ -130,13 +140,22 @@ fn run(cli: Cli) -> Result<()> {
             interval,
         } => {
             let both = !auto_save && !auto_restore;
-            for p in launchd::install(auto_save || both, auto_restore || both, interval.max(30))? {
-                println!("installed {}", p.display());
-            }
-            println!("logs: {}", store::state_dir().join("logs").display());
-            if auto_restore || both {
+            let config = launchd::AgentConfig {
+                restore: auto_restore || both,
+                save_every: (auto_save || both).then_some(interval.max(30)),
+            };
+            if config.restore {
                 fix_settings(&backends)?;
             }
+            let (path, legacy) = launchd::install(&config)?;
+            for p in legacy {
+                println!("removed the previous agent {}", p.display());
+            }
+            println!("installed {} ({})", path.display(), describe(&config));
+            println!(
+                "log: {}",
+                store::state_dir().join("logs/agent.log").display()
+            );
             Ok(())
         }
         Cmd::Uninstall => {
@@ -145,6 +164,10 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Agent {
+            restore,
+            save_every,
+        } => agent(&cli.backend, &backends, restore, save_every),
         Cmd::Config { init } => config(init),
         Cmd::Doctor { fix } => {
             if fix {
@@ -156,6 +179,44 @@ fn run(cli: Cli) -> Result<()> {
             print!("{SKILL}");
             Ok(())
         }
+    }
+}
+
+fn describe(c: &launchd::AgentConfig) -> String {
+    let mut parts = Vec::new();
+    if c.restore {
+        parts.push("restore at login".to_string());
+    }
+    if let Some(n) = c.save_every {
+        parts.push(format!("save every {n}s"));
+    }
+    if parts.is_empty() {
+        "does nothing".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// The LaunchAgent's process: restore once, then save in a loop. Errors are
+/// logged and the loop goes on.
+fn agent(
+    selection: &str,
+    backends: &[Box<dyn Backend>],
+    restore_first: bool,
+    save_every: Option<u64>,
+) -> Result<()> {
+    log!("agent started (version {})", env!("CARGO_PKG_VERSION"));
+    if restore_first && let Err(e) = restore(selection, None, false, false, true) {
+        log!("restore failed: {e:#}");
+    }
+    let Some(every) = save_every else {
+        return Ok(());
+    };
+    loop {
+        if let Err(e) = save(backends, true) {
+            log!("save failed: {e:#}");
+        }
+        std::thread::sleep(Duration::from_secs(every.max(30)));
     }
 }
 
@@ -241,7 +302,7 @@ fn save(backends: &[Box<dyn Backend>], auto: bool) -> Result<()> {
         // Right after a reboot the terminals may only show their own fresh
         // windows: never let that overwrite the snapshot still to be restored.
         let pending = latest.as_ref().is_some_and(|l| {
-            launchd::installed(launchd::RESTORE_LABEL)
+            launchd::restores_at_login()
                 && l.boot_time < snap.boot_time
                 && store::restored_boot() != Some(snap.boot_time)
         });
@@ -553,13 +614,17 @@ fn doctor(backends: &[Box<dyn Backend>]) -> Result<()> {
             );
         }
     }
-    for label in [launchd::SAVE_LABEL, launchd::RESTORE_LABEL] {
-        let state = if launchd::installed(label) {
-            "installed"
-        } else {
-            "not installed"
-        };
-        println!("[ok  ] {label}: {state}");
+    match launchd::agent_config() {
+        Some(c) => println!("[ok  ] agent {}: {}", launchd::AGENT_LABEL, describe(&c)),
+        None => println!("[ok  ] agent: not installed"),
+    }
+    let legacy = launchd::legacy_installed();
+    if !legacy.is_empty() {
+        println!(
+            "[warn] previous agents still installed ({}): they relaunch every 2 minutes; \
+             run `termrevive install` to replace them with the single agent",
+            legacy.join(", ")
+        );
     }
     match store::latest() {
         Ok(Some(s)) => println!(
