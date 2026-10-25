@@ -1,10 +1,12 @@
 //! Ghostty (macOS) through its AppleScript dictionary (Ghostty ≥ 1.3).
 
-use super::{Backend, RawLayout, RawTab, RawTerminal, RawWindow, WindowPlan};
+use super::{Backend, RawLayout, RawTab, RawTerminal, RawWindow, Setting, WindowPlan};
 use crate::procs::{self, Proc};
 use crate::rules::Launch;
 use anyhow::{Context, Result, bail};
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,92 @@ tell application "Ghostty"
 end tell
 return out
 "#;
+
+const SAVE_STATE: &str = "window-save-state";
+
+/// Ghostty's config files on macOS, in load order (a later one overrides).
+fn config_files() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("ghostty");
+    let support = home.join("Library/Application Support/com.mitchellh.ghostty");
+    vec![
+        xdg.join("config"),
+        xdg.join("config.ghostty"),
+        support.join("config"),
+        support.join("config.ghostty"),
+    ]
+}
+
+fn key_of(line: &str) -> Option<&str> {
+    let (k, _) = line.split_once('=')?;
+    let k = k.trim();
+    (!k.starts_with('#')).then_some(k)
+}
+
+/// Value of `key` across `files`, the last assignment winning.
+fn read_key(files: &[PathBuf], key: &str) -> Option<String> {
+    let mut value = None;
+    for text in files.iter().filter_map(|f| fs::read_to_string(f).ok()) {
+        for line in text.lines() {
+            if key_of(line) == Some(key) {
+                value = line.split_once('=').map(|(_, v)| v.trim().to_string());
+            }
+        }
+    }
+    value
+}
+
+/// `text` with every `key = …` line set to `value`, or one appended.
+fn set_key(text: &str, key: &str, value: &str) -> String {
+    let mut found = false;
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if key_of(line) == Some(key) {
+                found = true;
+                format!("{key} = {value}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        if out.last().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.push("# Set by termrevive, which restores windows and programs itself.".into());
+        out.push(format!("{key} = {value}"));
+    }
+    out.join("\n") + "\n"
+}
+
+/// Sets `key` in the file that decides it: the last one assigning it, else the
+/// first existing file, else a new `files[0]`.
+fn write_key(files: &[PathBuf], key: &str, value: &str) -> Result<PathBuf> {
+    let assigns = |f: &&PathBuf| {
+        fs::read_to_string(f).is_ok_and(|t| t.lines().any(|l| key_of(l) == Some(key)))
+    };
+    let target = files
+        .iter()
+        .rev()
+        .find(assigns)
+        .or_else(|| files.iter().find(|f| f.exists()))
+        .or(files.first())
+        .context("no Ghostty config location")?
+        .clone();
+    let text = fs::read_to_string(&target).unwrap_or_default();
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&target, set_key(&text, key, value))
+        .with_context(|| format!("writing {}", target.display()))?;
+    Ok(target)
+}
 
 fn osascript(script: &str) -> Result<String> {
     let mut child = Command::new("/usr/bin/osascript")
@@ -241,6 +329,19 @@ impl Backend for Ghostty {
         }
         osascript(&self.restore_script(window, delay_ms)).map(drop)
     }
+
+    fn settings(&self) -> Vec<Setting> {
+        vec![Setting {
+            name: SAVE_STATE,
+            current: read_key(&config_files(), SAVE_STATE),
+            wanted: "never",
+            why: "Ghostty reopens its own windows at launch, on top of a restore",
+        }]
+    }
+
+    fn apply_setting(&self, setting: &Setting) -> Result<PathBuf> {
+        write_key(&config_files(), setting.name, setting.wanted)
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +362,45 @@ mod tests {
         assert_eq!(l.windows[0].tabs[0].terminals[1].cwd, "/y");
         assert_eq!(l.windows[0].tabs[0].terminals[1].title, "");
         assert_eq!(l.windows[1].tabs[0].terminals[0].cwd, "");
+    }
+
+    #[test]
+    fn set_key_rewrites_or_appends() {
+        assert_eq!(
+            set_key(
+                "a = 1\nwindow-save-state = always\n# window-save-state = x\n",
+                SAVE_STATE,
+                "never"
+            ),
+            "a = 1\nwindow-save-state = never\n# window-save-state = x\n"
+        );
+        assert_eq!(
+            set_key("a = 1\n", SAVE_STATE, "never"),
+            "a = 1\n\n# Set by termrevive, which restores windows and programs itself.\nwindow-save-state = never\n"
+        );
+        assert!(set_key("", SAVE_STATE, "never").starts_with("# Set by termrevive"));
+    }
+
+    #[test]
+    fn write_key_targets_the_deciding_file() {
+        let dir = std::env::temp_dir().join(format!("termrevive-ghostty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let files = [dir.join("a/config"), dir.join("b/config")];
+        // Nothing exists: a new first file.
+        assert_eq!(write_key(&files, SAVE_STATE, "never").unwrap(), files[0]);
+        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("never"));
+        // A later file overrides it: that one gets rewritten.
+        fs::create_dir_all(files[1].parent().unwrap()).unwrap();
+        fs::write(&files[1], "font-size = 13\nwindow-save-state = always\n").unwrap();
+        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("always"));
+        assert_eq!(write_key(&files, SAVE_STATE, "never").unwrap(), files[1]);
+        assert_eq!(read_key(&files, SAVE_STATE).as_deref(), Some("never"));
+        assert!(
+            fs::read_to_string(&files[1])
+                .unwrap()
+                .starts_with("font-size = 13\n")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

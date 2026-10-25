@@ -6,6 +6,7 @@ pub mod ghostty;
 use crate::procs::Proc;
 use crate::rules::Launch;
 use anyhow::{Result, bail};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawLayout {
@@ -40,6 +41,22 @@ pub struct TabPlan {
     pub panes: Vec<Launch>,
 }
 
+/// A terminal setting that has to hold for restores to work.
+pub struct Setting {
+    pub name: &'static str,
+    /// `None`: not set anywhere, the terminal's default applies.
+    pub current: Option<String>,
+    pub wanted: &'static str,
+    /// What goes wrong otherwise.
+    pub why: &'static str,
+}
+
+impl Setting {
+    pub fn ok(&self) -> bool {
+        self.current.as_deref() == Some(self.wanted)
+    }
+}
+
 pub trait Backend {
     fn name(&self) -> &'static str;
     /// Emulator processes whose children are the shells (empty: not running).
@@ -53,6 +70,14 @@ pub trait Backend {
     /// The script `restore_window` would run, for `--dry-run`.
     fn restore_script(&self, window: &WindowPlan, delay_ms: u64) -> String;
     fn restore_window(&self, window: &WindowPlan, delay_ms: u64) -> Result<()>;
+    /// Settings of the terminal itself that restores depend on.
+    fn settings(&self) -> Vec<Setting> {
+        Vec::new()
+    }
+    /// Writes `setting.wanted` into the terminal's config; returns the file changed.
+    fn apply_setting(&self, setting: &Setting) -> Result<PathBuf> {
+        bail!("{} cannot set {}", self.name(), setting.name)
+    }
 }
 
 pub fn by_name(name: &str) -> Result<Box<dyn Backend>> {

@@ -19,8 +19,9 @@ cargo install --git https://github.com/maxgfr/termrevive
 termrevive doctor
 ```
 
-Add `window-save-state = never` to `~/.config/ghostty/config`: otherwise Ghostty
-reopens its own empty windows at launch on top of the restored ones.
+Ghostty must not reopen its own windows at launch, on top of the restored ones:
+`termrevive doctor --fix` sets `window-save-state = never` in the Ghostty config
+file that decides it (`termrevive install --auto-restore` does it too).
 
 The first run asks macOS for *Automation → Ghostty* permission.
 
@@ -53,7 +54,20 @@ termrevive uninstall
   Ghostty can't overwrite the snapshot you want back.
 - Auto-restore runs at login, only from a snapshot of a previous boot, once per
   boot. It starts Ghostty if needed and closes its blank startup window.
+  Installing it also applies `doctor --fix`.
 - Logs: `~/.local/state/termrevive/logs/`.
+
+## Agent skill
+
+```sh
+npx skills add maxgfr/termrevive            # pick the agents interactively
+npx skills add maxgfr/termrevive -a claude-code
+```
+
+The skill teaches Claude Code, Codex and other agents to save before a restart,
+check `show` before restoring, and ask before `--force`, `install` or
+`doctor --fix`. `termrevive skill` prints the copy that ships with the installed
+CLI.
 
 ## Rules
 
