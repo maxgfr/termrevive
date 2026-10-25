@@ -21,7 +21,6 @@ pub struct Proc {
 pub struct TtySession {
     pub tty: String,
     pub shell_pid: i32,
-    pub shell_cwd: Option<String>,
     /// Foreground job leader, if something other than the shell is running.
     pub fg: Option<Proc>,
 }
@@ -75,42 +74,53 @@ pub fn find_by_exe<'a>(procs: &'a [Proc], exe_suffix: &str) -> Vec<&'a Proc> {
 
 /// Shell sessions whose `login` (or shell) is a direct child of one of `parents`.
 pub fn tty_sessions(procs: &[Proc], parents: &[i32]) -> Vec<TtySession> {
-    let mut sessions = Vec::new();
-    for top in procs
+    let mut sessions: Vec<TtySession> = procs
         .iter()
         .filter(|p| parents.contains(&p.ppid) && p.tty != "??")
-    {
-        let shell = if basename(&top.comm) == "login" {
-            match procs.iter().find(|p| p.ppid == top.pid && p.tty == top.tty) {
-                Some(s) => s,
-                None => continue,
-            }
-        } else {
-            top
-        };
-        let fg = (shell.tpgid > 0 && shell.tpgid != shell.pgid)
-            .then(|| {
-                procs
-                    .iter()
-                    .find(|p| p.pid == shell.tpgid)
-                    .or_else(|| {
-                        procs
-                            .iter()
-                            .filter(|p| p.pgid == shell.tpgid)
-                            .min_by_key(|p| p.pid)
-                    })
-                    .cloned()
-            })
-            .flatten();
-        sessions.push(TtySession {
-            tty: shell.tty.clone(),
-            shell_pid: shell.pid,
-            shell_cwd: None,
-            fg,
-        });
-    }
+        .filter_map(|top| session_from(procs, top))
+        .collect();
     sessions.sort_by(|a, b| a.tty.cmp(&b.tty));
     sessions
+}
+
+/// The shell session on `tty` (`ttys004`): the topmost process there (the
+/// one whose parent is not on the tty), past `login`.
+pub fn session_on_tty(procs: &[Proc], tty: &str) -> Option<TtySession> {
+    let on_tty: Vec<&Proc> = procs.iter().filter(|p| p.tty == tty).collect();
+    let top = on_tty
+        .iter()
+        .filter(|p| !on_tty.iter().any(|q| q.pid == p.ppid))
+        .min_by_key(|p| p.pid)?;
+    session_from(procs, top)
+}
+
+fn session_from(procs: &[Proc], top: &Proc) -> Option<TtySession> {
+    let shell = if basename(&top.comm) == "login" {
+        procs
+            .iter()
+            .find(|p| p.ppid == top.pid && p.tty == top.tty)?
+    } else {
+        top
+    };
+    let fg = (shell.tpgid > 0 && shell.tpgid != shell.pgid)
+        .then(|| {
+            procs
+                .iter()
+                .find(|p| p.pid == shell.tpgid)
+                .or_else(|| {
+                    procs
+                        .iter()
+                        .filter(|p| p.pgid == shell.tpgid)
+                        .min_by_key(|p| p.pid)
+                })
+                .cloned()
+        })
+        .flatten();
+    Some(TtySession {
+        tty: shell.tty.clone(),
+        shell_pid: shell.pid,
+        fg,
+    })
 }
 
 /// Current working directories of `pids`, via one `lsof` call.
@@ -258,6 +268,15 @@ mod tests {
         assert_eq!(s[0].fg.as_ref().map(|p| p.pid), Some(46274));
         assert_eq!(s[1].shell_pid, 91580);
         assert!(s[1].fg.is_none());
+    }
+
+    #[test]
+    fn finds_the_shell_on_a_tty() {
+        let procs = parse_ps(PS);
+        let s = session_on_tty(&procs, "ttys000").unwrap();
+        assert_eq!(s.shell_pid, 46087);
+        assert_eq!(s.fg.map(|p| p.pid), Some(46274));
+        assert!(session_on_tty(&procs, "ttys009").is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod backend;
+mod capture;
 mod claude;
 mod launchd;
 mod matcher;
@@ -8,22 +9,22 @@ mod rules;
 mod store;
 
 use anyhow::{Context, Result, bail};
-use backend::{Backend, TabPlan, WindowPlan};
+use backend::{Backend, Caps, TabPlan, WindowPlan};
 use clap::{Parser, Subcommand};
-use matcher::Candidate;
-use model::{Program, SNAPSHOT_VERSION, Snapshot};
+use model::{Snapshot, Window};
 use rules::Config;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Save and restore terminal sessions: windows, tabs, splits, working
-/// directories and the programs running in them (Claude Code included).
+/// directories and the programs running in them (Claude Code included), for
+/// Ghostty, iTerm2, kitty and Terminal.app.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Terminal emulator to talk to.
-    #[arg(long, global = true, default_value = "ghostty")]
+    /// Terminal to act on: `auto` (every supported one), or ghostty, iterm2,
+    /// kitty, terminal.
+    #[arg(long, global = true, default_value = "auto")]
     backend: String,
     #[command(subcommand)]
     cmd: Cmd,
@@ -31,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Snapshot the current windows, tabs and panes.
+    /// Snapshot the windows, tabs and panes of the running terminals.
     Save {
         /// Unattended mode (LaunchAgent): skip quietly when there is nothing
         /// sensible to save, or when nothing changed.
@@ -43,10 +44,10 @@ enum Cmd {
         /// Snapshot file to use instead of the latest one.
         #[arg(long)]
         snapshot: Option<PathBuf>,
-        /// Print the generated scripts instead of running them.
+        /// Print what would run instead of running it.
         #[arg(long)]
         dry_run: bool,
-        /// Restore even if the terminal already has several panes open.
+        /// Restore even if a terminal already has several panes open.
         #[arg(long)]
         force: bool,
         /// Unattended mode (LaunchAgent at login): only once per boot, and
@@ -79,9 +80,10 @@ enum Cmd {
         #[arg(long)]
         init: bool,
     },
-    /// Check permissions, terminal settings and installed agents.
+    /// Check the terminals (permissions, settings), the agents and the config.
     Doctor {
-        /// Set the terminal settings restores need (Ghostty: window-save-state = never).
+        /// Set the terminal settings restores need (Ghostty window-save-state,
+        /// kitty remote control, iTerm2/Terminal.app window restoration).
         #[arg(long)]
         fix: bool,
     },
@@ -98,6 +100,11 @@ macro_rules! log {
 }
 
 fn main() {
+    // Exit quietly when the reader goes away (`termrevive show | head`).
+    // SAFETY: restoring the default SIGPIPE disposition has no preconditions.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("termrevive: {e:#}");
@@ -106,15 +113,15 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let backend = backend::by_name(&cli.backend)?;
+    let backends = backend::select(&cli.backend)?;
     match cli.cmd {
-        Cmd::Save { auto } => save(backend.as_ref(), auto),
+        Cmd::Save { auto } => save(&backends, auto),
         Cmd::Restore {
             snapshot,
             dry_run,
             force,
             auto,
-        } => restore(backend.as_ref(), snapshot, dry_run, force, auto),
+        } => restore(&cli.backend, snapshot, dry_run, force, auto),
         Cmd::Show { snapshot } => show(&load(snapshot)?, &Config::load()?),
         Cmd::List => list(),
         Cmd::Install {
@@ -128,7 +135,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             println!("logs: {}", store::state_dir().join("logs").display());
             if auto_restore || both {
-                fix_settings(backend.as_ref())?;
+                fix_settings(&backends)?;
             }
             Ok(())
         }
@@ -141,9 +148,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Config { init } => config(init),
         Cmd::Doctor { fix } => {
             if fix {
-                fix_settings(backend.as_ref())?;
+                fix_settings(&backends)?;
             }
-            doctor(backend.as_ref())
+            doctor(&backends)
         }
         Cmd::Skill => {
             print!("{SKILL}");
@@ -152,72 +159,33 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Reads the terminal and the process table into a snapshot; `None` when the
-/// terminal is not running.
-fn capture(backend: &dyn Backend) -> Result<Option<Snapshot>> {
-    let procs = procs::process_table()?;
-    let hosts = backend.host_pids(&procs);
-    if hosts.is_empty() {
-        return Ok(None);
-    }
-    let layout = backend.read_layout()?;
-    let sessions = procs::tty_sessions(&procs, &hosts);
-    let cwds = procs::cwds(&sessions.iter().map(|s| s.shell_pid).collect::<Vec<_>>());
-    let tty_of: HashMap<i32, &str> = procs.iter().map(|p| (p.pid, p.tty.as_str())).collect();
-    let claude = claude::live_sessions(|pid| tty_of.contains_key(&pid));
-
-    let candidates = sessions
-        .iter()
-        .map(|s| {
-            let on_tty = claude
-                .iter()
-                .filter(|(pid, _)| tty_of.get(pid) == Some(&s.tty.as_str()))
-                .min_by_key(|(pid, _)| **pid);
-            let program = match on_tty {
-                Some((pid, session)) => Some(Program {
-                    name: "claude".into(),
-                    argv: procs::argv(*pid).unwrap_or_else(|| vec!["claude".into()]),
-                    claude: Some(session.clone()),
-                }),
-                None => s.fg.as_ref().map(|fg| {
-                    let argv = procs::argv(fg.pid).unwrap_or_else(|| vec![fg.comm.clone()]);
-                    Program {
-                        name: procs::basename(&argv[0]).to_string(),
-                        argv,
-                        claude: None,
-                    }
-                }),
-            };
-            Candidate {
-                cwd: cwds.get(&s.shell_pid).cloned(),
-                program,
-            }
-        })
-        .collect();
-
-    Ok(Some(Snapshot {
-        version: SNAPSHOT_VERSION,
-        taken_at: chrono::Local::now(),
-        boot_time: procs::boot_time(),
-        backend: backend.name().into(),
-        windows: matcher::assemble(&layout, candidates),
-    }))
-}
-
 fn summary(s: &Snapshot) -> String {
+    let terminals: Vec<String> = s.backends().iter().map(|b| display(b)).collect();
     format!(
-        "{} window(s), {} tab(s), {} pane(s), {} Claude session(s)",
+        "{} window(s), {} tab(s), {} pane(s), {} Claude session(s){}",
         s.windows.len(),
         s.tab_count(),
         s.pane_count(),
-        s.claude_count()
+        s.claude_count(),
+        if terminals.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", terminals.join(", "))
+        }
     )
+}
+
+/// A backend's display name, or the raw name if it is unknown.
+fn display(name: &str) -> String {
+    backend::by_name(name)
+        .map(|b| b.display_name().to_string())
+        .unwrap_or_else(|_| name.to_string())
 }
 
 /// Equal up to the status glyphs programs put in titles (Claude Code's spinner
 /// changes them every few seconds), so auto-save does not rewrite on every tick.
-fn same_layout(a: &[model::Window], b: &[model::Window]) -> bool {
-    let norm = |ws: &[model::Window]| {
+fn same_layout(a: &[Window], b: &[Window]) -> bool {
+    let norm = |ws: &[Window]| {
         let mut ws = ws.to_vec();
         for t in ws.iter_mut().flat_map(|w| &mut w.tabs) {
             t.title = matcher::strip_title(&t.title).to_string();
@@ -230,18 +198,38 @@ fn same_layout(a: &[model::Window], b: &[model::Window]) -> bool {
     norm(a) == norm(b)
 }
 
-fn save(backend: &dyn Backend, auto: bool) -> Result<()> {
+fn save(backends: &[Box<dyn Backend>], auto: bool) -> Result<()> {
+    let note = |msg: String| {
+        if auto {
+            log!("{msg}")
+        } else {
+            eprintln!("{msg}")
+        }
+    };
     if auto && store::RestoreLock::held() {
-        log!("skip: a restore is running");
+        note("skip: a restore is running".into());
         return Ok(());
     }
-    let Some(snap) = capture(backend)? else {
+    let cap = capture::capture(backends)?;
+    for (_, e) in &cap.errors {
+        note(format!("warning: {e}"));
+    }
+    let Some(mut snap) = cap.snapshot else {
         if auto {
-            log!("skip: {} is not running", backend.name());
+            log!("skip: no supported terminal is running");
             return Ok(());
         }
-        bail!("{} is not running", backend.name());
+        bail!("no supported terminal is running ({})", backend::names());
     };
+    let latest = store::latest().ok().flatten();
+    // A terminal that runs but could not be read keeps its windows from the
+    // previous snapshot rather than vanishing from this one.
+    if let Some(l) = &latest {
+        for (name, _) in &cap.errors {
+            snap.windows
+                .extend(l.windows.iter().filter(|w| &w.backend == name).cloned());
+        }
+    }
     if snap.pane_count() == 0 {
         if auto {
             log!("skip: no open terminal");
@@ -249,9 +237,8 @@ fn save(backend: &dyn Backend, auto: bool) -> Result<()> {
         }
         bail!("no open terminal to save");
     }
-    let latest = store::latest().ok().flatten();
     if auto {
-        // Right after a reboot the terminal may only show its own fresh
+        // Right after a reboot the terminals may only show their own fresh
         // windows: never let that overwrite the snapshot still to be restored.
         let pending = latest.as_ref().is_some_and(|l| {
             launchd::installed(launchd::RESTORE_LABEL)
@@ -284,25 +271,51 @@ fn load(path: Option<PathBuf>) -> Result<Snapshot> {
     }
 }
 
-fn plan(snap: &Snapshot, cfg: &Config) -> Vec<WindowPlan> {
-    snap.windows
+/// Restore plans for `windows`. A terminal without splits gets each extra pane
+/// as a tab of its own, so nothing is dropped.
+fn plan(windows: &[&Window], cfg: &Config, caps: Caps) -> Vec<WindowPlan> {
+    windows
         .iter()
         .map(|w| WindowPlan {
             tabs: w
                 .tabs
                 .iter()
                 .filter(|t| !t.panes.is_empty())
-                .map(|t| TabPlan {
-                    selected: t.selected,
-                    panes: t.panes.iter().map(|p| cfg.launch(p)).collect(),
+                .flat_map(|t| {
+                    let panes: Vec<_> = t.panes.iter().map(|p| cfg.launch(p)).collect();
+                    if caps.splits {
+                        vec![TabPlan {
+                            selected: t.selected,
+                            panes,
+                        }]
+                    } else {
+                        panes
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, p)| TabPlan {
+                                selected: t.selected && i == 0,
+                                panes: vec![p],
+                            })
+                            .collect()
+                    }
                 })
                 .collect(),
         })
         .collect()
 }
 
+/// Panes currently open in `b`.
+fn open_panes(b: &dyn Backend) -> Result<usize> {
+    Ok(b.read_layout(&procs::process_table()?)?
+        .windows
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .map(|t| t.terminals.len())
+        .sum())
+}
+
 fn restore(
-    backend: &dyn Backend,
+    selection: &str,
     path: Option<PathBuf>,
     dry_run: bool,
     force: bool,
@@ -310,18 +323,34 @@ fn restore(
 ) -> Result<()> {
     let cfg = Config::load()?;
     let snap = load(path)?;
-    if snap.backend != backend.name() {
-        bail!(
-            "snapshot was taken with `{}`, not `{}`",
-            snap.backend,
-            backend.name()
-        );
+    let names: Vec<String> = snap
+        .backends()
+        .into_iter()
+        .filter(|n| selection == "auto" || n == selection)
+        .collect();
+    if names.is_empty() {
+        bail!("the snapshot has no window for `{selection}`");
     }
-    // The front window comes first in the snapshot: create it last.
-    let plans: Vec<WindowPlan> = plan(&snap, &cfg).into_iter().rev().collect();
+    let mut groups: Vec<(Box<dyn Backend>, Vec<WindowPlan>)> = Vec::new();
+    for name in &names {
+        let b = match backend::by_name(name) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping windows of {name}: {e:#}");
+                continue;
+            }
+        };
+        let windows: Vec<&Window> = snap.windows.iter().filter(|w| &w.backend == name).collect();
+        // The front window comes first in the snapshot: create it last.
+        let plans: Vec<WindowPlan> = plan(&windows, &cfg, b.caps()).into_iter().rev().collect();
+        groups.push((b, plans));
+    }
     if dry_run {
-        for p in &plans {
-            println!("{}", backend.restore_script(p, cfg.restore.delay_ms));
+        for (b, plans) in &groups {
+            println!("# {}", b.display_name());
+            for p in plans {
+                println!("{}", b.restore_script(p, cfg.restore.delay_ms));
+            }
         }
         return Ok(());
     }
@@ -338,32 +367,24 @@ fn restore(
         }
     }
 
-    let was_running = !backend.host_pids(&procs::process_table()?).is_empty();
-    backend.ensure_running()?;
-    let blank = if was_running {
-        if !force && !auto {
-            let open: usize = backend
-                .read_layout()?
-                .windows
-                .iter()
-                .flat_map(|w| &w.tabs)
-                .map(|t| t.terminals.len())
-                .sum();
+    // Check every terminal before touching any.
+    let procs = procs::process_table()?;
+    let mut was_running = Vec::new();
+    for (b, _) in &groups {
+        let running = b.running(&procs);
+        if running && !force && !auto {
+            let open = open_panes(b.as_ref())?;
             if open > 1 {
                 bail!(
-                    "{} already has {open} panes open; restoring would duplicate them. \
-                     Close them or pass --force (and see `termrevive doctor` about the \
-                     terminal's own window restoration).",
-                    backend.name()
+                    "{} already has {open} panes open; restoring would duplicate them. Close \
+                     them, pass --force, or restore another terminal with --backend (see \
+                     `termrevive doctor` about the terminal's own window restoration).",
+                    b.display_name()
                 );
             }
         }
-        Vec::new()
-    } else {
-        // Give the freshly launched app a moment to open its default window.
-        std::thread::sleep(Duration::from_secs(1));
-        backend.blank_windows().unwrap_or_default()
-    };
+        was_running.push(running);
+    }
 
     let _lock = store::RestoreLock::acquire()?;
     let say = |msg: String| {
@@ -378,41 +399,56 @@ fn restore(
         summary(&snap),
         snap.taken_at.format("%F %T")
     ));
-    for (i, p) in plans.iter().enumerate() {
-        if i > 0 {
-            std::thread::sleep(Duration::from_millis(cfg.restore.delay_ms));
+    let mut failures = Vec::new();
+    for ((b, plans), was_running) in groups.iter().zip(was_running) {
+        let result = (|| -> Result<()> {
+            b.ensure_running()?;
+            let blank = if was_running {
+                Vec::new()
+            } else {
+                // Give the freshly launched app a moment to open its default window.
+                std::thread::sleep(Duration::from_secs(1));
+                b.blank_windows().unwrap_or_default()
+            };
+            for (i, p) in plans.iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(cfg.restore.delay_ms));
+                }
+                b.restore_window(p, cfg.restore.delay_ms)
+                    .with_context(|| format!("restoring window {}/{}", i + 1, plans.len()))?;
+                say(format!(
+                    "{}: window {}/{} done ({} tab(s))",
+                    b.display_name(),
+                    i + 1,
+                    plans.len(),
+                    p.tabs.len()
+                ));
+            }
+            b.close_windows(&blank)
+        })();
+        if let Err(e) = result {
+            say(format!("{}: {e:#}", b.display_name()));
+            failures.push(b.display_name());
         }
-        backend
-            .restore_window(p, cfg.restore.delay_ms)
-            .with_context(|| format!("restoring window {}/{}", i + 1, plans.len()))?;
-        say(format!(
-            "window {}/{} done ({} tab(s))",
-            i + 1,
-            plans.len(),
-            p.tabs.len()
-        ));
     }
-    backend.close_windows(&blank)?;
     if auto {
         store::mark_restored(boot)?;
+    }
+    if !failures.is_empty() {
+        bail!("could not restore {}", failures.join(", "));
     }
     Ok(())
 }
 
 fn show(snap: &Snapshot, cfg: &Config) -> Result<()> {
-    println!(
-        "{} ({}) — {}",
-        snap.taken_at.format("%F %T"),
-        snap.backend,
-        summary(snap)
-    );
+    println!("{} — {}", snap.taken_at.format("%F %T"), summary(snap));
     for (wi, w) in snap.windows.iter().enumerate() {
         let tag = if w.orphans {
             " (programs without a visible terminal)"
         } else {
             ""
         };
-        println!("\nwindow {}{tag}", wi + 1);
+        println!("\nwindow {} · {}{tag}", wi + 1, display(&w.backend));
         for (ti, t) in w.tabs.iter().enumerate() {
             let sel = if t.selected { "*" } else { " " };
             println!("  {sel}tab {}  {}", ti + 1, t.title);
@@ -465,48 +501,57 @@ fn config(init: bool) -> Result<()> {
     Ok(())
 }
 
-/// Writes every terminal setting restores depend on that is not set yet.
-fn fix_settings(backend: &dyn Backend) -> Result<()> {
-    for s in backend.settings().into_iter().filter(|s| !s.ok()) {
-        let path = backend.apply_setting(&s)?;
-        println!(
-            "set {} {} = {} in {} (was {})",
-            backend.name(),
-            s.name,
-            s.wanted,
-            path.display(),
-            s.current.as_deref().unwrap_or("default")
-        );
+/// Writes every setting restores depend on, for the installed terminals.
+fn fix_settings(backends: &[Box<dyn Backend>]) -> Result<()> {
+    for b in backends.iter().filter(|b| b.installed()) {
+        for s in b.settings().into_iter().filter(|s| !s.ok) {
+            let path = b.apply_setting(&s)?;
+            println!(
+                "set {} {} = {} in {} (was {})",
+                b.display_name(),
+                s.name,
+                s.wanted,
+                path.display(),
+                s.current.as_deref().unwrap_or("default")
+            );
+        }
     }
     Ok(())
 }
 
-fn doctor(backend: &dyn Backend) -> Result<()> {
+fn doctor(backends: &[Box<dyn Backend>]) -> Result<()> {
     let ok = |b: bool| if b { "ok  " } else { "warn" };
-    let running = !backend.host_pids(&procs::process_table()?).is_empty();
-    println!("[{}] {} running", ok(running), backend.name());
-    if running {
-        match backend.read_layout() {
-            Ok(l) => println!(
-                "[ok  ] automation access ({} window(s) visible)",
-                l.windows.len()
-            ),
-            Err(e) => println!("[warn] automation access: {e:#}"),
+    let procs = procs::process_table()?;
+    for b in backends {
+        let name = b.display_name();
+        if !b.installed() {
+            println!("[ -- ] {name}: not installed");
+            continue;
         }
-    }
-    for s in backend.settings() {
-        let fix = if s.ok() {
-            String::new()
+        if b.running(&procs) {
+            match b.read_layout(&procs) {
+                Ok(l) => println!(
+                    "[ok  ] {name}: running, readable ({} window(s))",
+                    l.windows.len()
+                ),
+                Err(e) => println!("[warn] {name}: running but unreadable: {e:#}"),
+            }
         } else {
-            format!("  → {}; fix: `termrevive doctor --fix`", s.why)
-        };
-        println!(
-            "[{}] {} {} = {}{fix}",
-            ok(s.ok()),
-            backend.name(),
-            s.name,
-            s.current.as_deref().unwrap_or("default"),
-        );
+            println!("[ok  ] {name}: installed, not running");
+        }
+        for s in b.settings() {
+            let fix = if s.ok {
+                String::new()
+            } else {
+                format!("  → {}; fix: `termrevive doctor --fix`", s.why)
+            };
+            println!(
+                "[{}] {name} {} = {}{fix}",
+                ok(s.ok),
+                s.name,
+                s.current.as_deref().unwrap_or("default"),
+            );
+        }
     }
     for label in [launchd::SAVE_LABEL, launchd::RESTORE_LABEL] {
         let state = if launchd::installed(label) {
@@ -538,10 +583,11 @@ fn doctor(backend: &dyn Backend) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::{Pane, Tab, Window};
+    use model::{Pane, Tab};
 
     fn win(title: &str, cwd: &str) -> Vec<Window> {
         vec![Window {
+            backend: "ghostty".into(),
             orphans: false,
             tabs: vec![Tab {
                 title: title.into(),
@@ -566,5 +612,19 @@ mod tests {
             &win("✳ fix-bug", "/b")
         ));
         assert!(!same_layout(&win("✳ fix-bug", "/a"), &win("✳ other", "/a")));
+    }
+
+    #[test]
+    fn terminals_without_splits_get_extra_panes_as_tabs() {
+        let mut w = win("t", "/").remove(0);
+        let pane = w.tabs[0].panes[0].clone();
+        w.tabs[0].panes.push(pane);
+        let cfg = Config::default();
+        let split = plan(&[&w], &cfg, Caps { splits: true });
+        assert_eq!(split[0].tabs.len(), 1);
+        assert_eq!(split[0].tabs[0].panes.len(), 2);
+        let flat = plan(&[&w], &cfg, Caps { splits: false });
+        assert_eq!(flat[0].tabs.len(), 2);
+        assert!(flat[0].tabs[0].selected && !flat[0].tabs[1].selected);
     }
 }
