@@ -9,9 +9,10 @@ each running an agent session.
 - The codebase is small (about 4 800 lines, 8 direct dependencies), consistently
   structured (one file per terminal, one per agent CLI) and its parsers and
   script generators were already tested; fmt, clippy and the 49 tests passed.
-- No critical defect. Nine bugs sat in edge paths: the restore lock, rule
-  rendering and quoting, the agent's environment, non-ASCII directories, stale
-  Claude Code registry entries.
+- No critical defect in the code; the one critical finding is around it: CI and
+  the release can no longer run (retired runner image, see below). Nine bugs sat
+  in edge paths: the restore lock, rule rendering and quoting, the agent's
+  environment, non-ASCII directories, stale Claude Code registry entries.
 - All nine are fixed, eight with a regression test (49 → 56 tests).
 - A save was dominated by one thing, the Ghostty read script: a whole
   `termrevive save` went from about 1.0 s to about 0.28 s.
@@ -88,13 +89,27 @@ Measured and not done, the gain being too small for the code it needs:
 6. Ghostty is read with a different AppleScript, checked on Ghostty 1.4.0 only;
    older versions fall back to the previous script if it fails.
 
-Pushing these commits to `main` publishes a patch release.
+These commits are on `main` but not released: see the critical finding below.
 
 ## Found, not fixed
 
 ### Critical
 
-None.
+1. **CI and the release cannot run: `macos-14` is gone.** Both workflows pin
+   `runs-on: macos-14` (`ci.yml`, job `rust`; `release.yml`, both entries of the
+   build matrix). GitHub retired every macOS 14 image from Actions on
+   2026-11-02. The run started by this audit's push was cancelled within two
+   seconds, before any step, with "The configuration
+   'macos-14-arm64-us-default' is not supported"; a re-run ended the same way.
+   So nothing pushed since that date is checked by CI, and no release is
+   published: the commits of this audit were verified locally only (fmt,
+   clippy, tests and a release build on arm64; the x86_64 build was not, the
+   target not being installed here).
+   Recommendation: replace `macos-14` with `macos-15` (arm64, like `macos-14`
+   was) in the three places. The workflows were left alone, deployment
+   configuration being out of this audit's scope. Once fixed, the next push to
+   `main`, or a manual run of the Release workflow, releases everything since
+   v1.3.0 as one patch version.
 
 ### Important
 
@@ -157,18 +172,20 @@ None.
 
 ## Open questions
 
-1. **A user rule matching an agent with no `cwd`** runs in the pane's shell
+1. **The runner image** (Critical 1): `macos-15`, or `macos-latest` to stop
+   pinning a version that gets retired?
+2. **A user rule matching an agent with no `cwd`** runs in the pane's shell
    directory, not the session's. `claude --resume` needs the session's project
    directory, so a rule that only changes the command breaks sessions living in
    a worktree unless it also sets `cwd = "{session_cwd}"`. Should the session's
    directory be the default for agent sessions?
-2. **`ssh` and `mosh` are re-run automatically** with their saved arguments,
+3. **`ssh` and `mosh` are re-run automatically** with their saved arguments,
    including a remote command (`ssh host 'rm -rf build'`) or port forwards.
    Should a saved `ssh` with a command be typed without Enter?
-3. **The pre-reboot snapshot in auto-save-only mode** (Important 1): protect it,
+4. **The pre-reboot snapshot in auto-save-only mode** (Important 1): protect it,
    or document the two-minute window?
-4. **Log policy** (Important 3): only changes, a size cap, or both?
-5. **Snapshot permissions**: 0600?
-6. **Boot identity** (Important 6): add `kern.bootsessionuuid` to snapshots?
-7. **The release profile**: 0.8 MB saved for about 30 s more per release build
+5. **Log policy** (Important 3): only changes, a size cap, or both?
+6. **Snapshot permissions**: 0600?
+7. **Boot identity** (Important 6): add `kern.bootsessionuuid` to snapshots?
+8. **The release profile**: 0.8 MB saved for about 30 s more per release build
    and per `cargo install`. Keep it, or only `strip` (-21 %, no build cost)?
