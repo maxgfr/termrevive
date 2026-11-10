@@ -313,10 +313,11 @@ fn save(backends: &[Box<dyn Backend>], auto: bool) -> Result<()> {
     if auto {
         // Right after a reboot the terminals may only show their own fresh
         // windows: never let that overwrite the snapshot still to be restored.
+        // Reading the agent's plist costs a process: only after a reboot.
         let pending = latest.as_ref().is_some_and(|l| {
-            launchd::restores_at_login()
-                && l.boot_time < snap.boot_time
+            l.boot_time < snap.boot_time
                 && store::restored_boot() != Some(snap.boot_time)
+                && launchd::restores_at_login()
         });
         if pending {
             log!("skip: waiting for the auto-restore of this boot");
@@ -383,8 +384,8 @@ fn covers(snap: &Snapshot, names: &[String]) -> bool {
 }
 
 /// Panes currently open in `b`.
-fn open_panes(b: &dyn Backend) -> Result<usize> {
-    Ok(b.read_layout(&procs::process_table()?)?
+fn open_panes(b: &dyn Backend, procs: &[procs::Proc]) -> Result<usize> {
+    Ok(b.read_layout(procs)?
         .windows
         .iter()
         .flat_map(|w| &w.tabs)
@@ -451,7 +452,7 @@ fn restore(
     for (b, _) in &groups {
         let running = b.running(&procs);
         if running && !force && !auto {
-            let open = open_panes(b.as_ref())?;
+            let open = open_panes(b.as_ref(), &procs)?;
             if open > 1 {
                 bail!(
                     "{} already has {open} panes open; restoring would duplicate them. Close \
