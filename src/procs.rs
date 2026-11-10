@@ -123,36 +123,40 @@ fn session_from(procs: &[Proc], top: &Proc) -> Option<TtySession> {
     })
 }
 
-/// Current working directories of `pids`, via one `lsof` call.
-pub fn cwds(pids: &[i32]) -> HashMap<i32, String> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let list = pids
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let Ok(out) = Command::new("/usr/sbin/lsof")
-        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
-        .output()
-    else {
-        return HashMap::new();
+/// Current working directory of `pid`, asked from the kernel (libproc);
+/// `None` when the process is gone or belongs to another user.
+pub fn cwd(pid: i32) -> Option<String> {
+    // SAFETY: zeroed is a valid proc_vnodepathinfo; proc_pidinfo writes at most `size` bytes.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
     };
-    parse_lsof(&String::from_utf8_lossy(&out.stdout))
+    if n != size {
+        return None;
+    }
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    (!path.is_empty()).then(|| String::from_utf8_lossy(&path).into_owned())
 }
 
-fn parse_lsof(text: &str) -> HashMap<i32, String> {
-    let mut map = HashMap::new();
-    let mut pid = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            pid = p.parse().ok();
-        } else if let (Some(n), Some(p)) = (line.strip_prefix('n'), pid) {
-            map.insert(p, n.to_string());
-        }
-    }
-    map
+/// Current working directories of `pids`; those that cannot be read are left out.
+pub fn cwds(pids: &[i32]) -> HashMap<i32, String> {
+    pids.iter()
+        .filter_map(|&pid| Some((pid, cwd(pid)?)))
+        .collect()
 }
 
 /// Exact argv of `pid` (KERN_PROCARGS2), so arguments with spaces survive.
@@ -290,9 +294,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_lsof_fields() {
-        let m = parse_lsof("p35736\nfcwd\nn/Users/me\np46087\nfcwd\nn/Users/me/a b\n");
-        assert_eq!(m[&46087], "/Users/me/a b");
+    fn reads_a_working_directory_with_spaces_and_accents() {
+        let dir = std::env::temp_dir().join(format!("termrevive été {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // i32::MAX is no process: it is left out rather than failing the lot.
+        let got = cwds(&[pid, i32::MAX]);
+        let _ = child.kill();
+        let _ = child.wait();
+        let want = dir.canonicalize().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get(&pid).map(String::as_str), want.to_str());
     }
 
     #[test]

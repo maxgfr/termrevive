@@ -149,7 +149,7 @@ aliases (`claude=…`) apply.
 
 Each terminal's scripting interface (AppleScript, or `kitten @` for kitty) lists
 windows → tabs → panes. termrevive reads the process table (shell and
-foreground job of each tty, exact argv via `KERN_PROCARGS2`, cwd via `lsof`),
+foreground job of each tty, exact argv via `KERN_PROCARGS2`, cwd via libproc),
 asks each harness whether one of a pane's processes is its CLI and which
 session it works on, then pairs every pane with its shell: exactly when the
 terminal reports the pane's tty (iTerm2, Terminal.app) or shell pid (kitty), by
