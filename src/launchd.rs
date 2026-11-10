@@ -38,7 +38,52 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn plist(label: &str, exe: &Path, args: &[&str], trigger: &str, log: &Path) -> String {
+/// Variables that move termrevive's own files or an agent's session registry.
+/// launchd starts the agent without the shell's environment: the ones set
+/// when the agent is installed go into its plist, so that the agent and the
+/// command line read and write the same places.
+const ENV_OVERRIDES: [&str; 7] = [
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "VIBE_HOME",
+    "KITTY_CONFIG_DIRECTORY",
+];
+
+fn env_overrides() -> Vec<(String, String)> {
+    ENV_OVERRIDES
+        .into_iter()
+        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
+/// The plist's `EnvironmentVariables` entry; empty when there is none to set.
+fn env_dict(env: &[(String, String)]) -> String {
+    if env.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
+    for (k, v) in env {
+        s += &format!(
+            "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+            xml_escape(k),
+            xml_escape(v)
+        );
+    }
+    s + "\t</dict>\n"
+}
+
+fn plist(
+    label: &str,
+    exe: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+    trigger: &str,
+    log: &Path,
+) -> String {
     let mut argv = format!(
         "\t\t<string>{}</string>\n",
         xml_escape(&exe.display().to_string())
@@ -46,6 +91,7 @@ fn plist(label: &str, exe: &Path, args: &[&str], trigger: &str, log: &Path) -> S
     for a in args {
         argv += &format!("\t\t<string>{}</string>\n", xml_escape(a));
     }
+    let env = env_dict(env);
     let log = xml_escape(&log.display().to_string());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -57,7 +103,7 @@ fn plist(label: &str, exe: &Path, args: &[&str], trigger: &str, log: &Path) -> S
 	<key>ProgramArguments</key>
 	<array>
 {argv}	</array>
-{trigger}	<key>ProcessType</key>
+{env}{trigger}	<key>ProcessType</key>
 	<string>Background</string>
 	<key>StandardOutPath</key>
 	<string>{log}</string>
@@ -204,7 +250,14 @@ pub fn install(config: &AgentConfig) -> Result<(PathBuf, Vec<PathBuf>)> {
     let trigger = "\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n";
     let args = agent_args(config);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let body = plist(AGENT_LABEL, &exe, &refs, trigger, &logs.join("agent.log"));
+    let body = plist(
+        AGENT_LABEL,
+        &exe,
+        &refs,
+        &env_overrides(),
+        trigger,
+        &logs.join("agent.log"),
+    );
     Ok((install_one(AGENT_LABEL, &body)?, removed))
 }
 
@@ -227,12 +280,14 @@ mod tests {
             AGENT_LABEL,
             Path::new("/bin/a&b"),
             &["save", "--auto"],
+            &[],
             "",
             Path::new("/tmp/l"),
         );
         assert!(p.contains(
             "<string>/bin/a&amp;b</string>\n\t\t<string>save</string>\n\t\t<string>--auto</string>"
         ));
+        assert!(!p.contains("EnvironmentVariables"));
     }
 
     #[test]
@@ -282,9 +337,19 @@ mod tests {
             AGENT_LABEL,
             Path::new("/bin/x"),
             &["agent", "--restore", "--save-every", "120"],
+            &[
+                (
+                    "XDG_STATE_HOME".to_string(),
+                    "/Users/me/a <b> & c".to_string(),
+                ),
+                ("CODEX_HOME".to_string(), "/Users/me/.codex2".to_string()),
+            ],
             trigger,
             Path::new("/tmp/l"),
         );
+        assert!(p.contains(
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>XDG_STATE_HOME</key>\n\t\t<string>/Users/me/a &lt;b&gt; &amp; c</string>\n"
+        ));
         let file =
             std::env::temp_dir().join(format!("termrevive-test-{}.plist", std::process::id()));
         fs::write(&file, p).unwrap();

@@ -97,6 +97,11 @@ trigger it each time; `install` replaces them).
   boot. It starts each terminal if needed and closes its blank startup window.
   Installing it also applies `doctor --fix`.
 - Log: `~/.local/state/termrevive/logs/agent.log`.
+- launchd does not pass your shell's environment on: `install` copies the
+  variables that move termrevive's or an agent's files (`XDG_STATE_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `VIBE_HOME`, `KITTY_CONFIG_DIRECTORY`) into the agent. Run it again after
+  changing one of them.
 - After a `brew upgrade`, run `termrevive install` again: the agent keeps
   running the previous binary until then, and macOS may refuse its next launch
   (`OS_REASON_CODESIGNING`) until it is re-registered.
