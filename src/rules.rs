@@ -286,8 +286,10 @@ fn render(template: &str, pane: &Pane, quote: bool) -> Option<String> {
 }
 
 pub fn shell_quote(s: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-~".contains(c);
-    if !s.is_empty() && s.chars().all(safe) && !s.starts_with('~') {
+    // `~` is left out: it expands at the start of a word and, in bash, after
+    // a `=` or `:`. A leading `=` is zsh's `=command` expansion.
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !s.is_empty() && s.chars().all(safe) && !s.starts_with('=') {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -397,6 +399,19 @@ mod tests {
         let l = Config::default().launch(&pane("nvim", &["nvim", "my file's.txt"], None));
         assert_eq!(l.input.as_deref(), Some(r"nvim 'my file'\''s.txt'"));
         assert!(l.run);
+    }
+
+    #[test]
+    fn quotes_what_a_shell_would_expand() {
+        for plain in ["make", "--flag=v", "a/b.c", "user@host:22", "x,y", "+%s"] {
+            assert_eq!(shell_quote(plain), plain);
+        }
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("=ls"), "'=ls'", "zsh: =ls is /bin/ls");
+        assert_eq!(shell_quote("~/x"), "'~/x'");
+        assert_eq!(shell_quote("dir=~"), "'dir=~'", "bash expands it");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
     }
 
     #[test]
