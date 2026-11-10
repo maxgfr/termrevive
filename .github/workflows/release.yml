@@ -59,9 +59,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
           # Cross-compiled on Apple silicon; Rosetta runs it for the checks below.
-          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
