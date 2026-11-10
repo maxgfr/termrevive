@@ -200,7 +200,11 @@ tell application "Terminal" to count windows"#,
         if window.tabs.iter().all(|t| t.panes.is_empty()) {
             return Ok(());
         }
-        osa::run(&self.restore_script(window, delay_ms)).map(drop)
+        osa::run_for(
+            &self.restore_script(window, delay_ms),
+            window.timeout(delay_ms),
+        )
+        .map(drop)
     }
 
     fn settings(&self) -> Vec<Setting> {

@@ -18,6 +18,7 @@ use crate::procs::Proc;
 use crate::rules::Launch;
 use anyhow::{Result, bail};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawLayout {
@@ -54,6 +55,15 @@ pub struct WindowPlan {
 pub struct TabPlan {
     pub selected: bool,
     pub panes: Vec<Launch>,
+}
+
+impl WindowPlan {
+    /// How long rebuilding the window may take before it counts as hung: a
+    /// minute, plus the pause and a few seconds for each pane.
+    pub fn timeout(&self, delay_ms: u64) -> Duration {
+        let panes: u64 = self.tabs.iter().map(|t| t.panes.len() as u64).sum();
+        Duration::from_millis(60_000 + panes * (delay_ms + 5_000))
+    }
 }
 
 /// What a terminal can rebuild.

@@ -7,13 +7,13 @@
 use super::applescript as osa;
 use super::conf::{self, Syntax};
 use super::{Backend, Caps, RawLayout, RawTab, RawTerminal, RawWindow, Setting, WindowPlan};
+use crate::exec;
 use crate::procs::{self, Proc};
 use crate::rules::Launch;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub struct Kitty;
@@ -67,20 +67,11 @@ fn kitten(procs: &[Proc]) -> PathBuf {
 
 /// Runs `kitten @ --to <socket> <args>`, with `stdin` piped in.
 fn remote(kitten: &Path, socket: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
-    let mut child = Command::new(kitten)
-        .args(["@", "--to", socket])
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("running {}", kitten.display()))?;
-    let mut input = child.stdin.take().expect("piped stdin");
-    if let Some(text) = stdin {
-        input.write_all(text.as_bytes())?;
-    }
-    drop(input);
-    let out = child.wait_with_output()?;
+    let out = exec::output(
+        Command::new(kitten).args(["@", "--to", socket]).args(args),
+        stdin,
+        exec::QUICK,
+    )?;
     if !out.status.success() {
         bail!(
             "kitten @ {} failed: {}",
@@ -97,10 +88,11 @@ fn connect_all(procs: &[Proc]) -> Vec<(String, String)> {
     let kitten = kitten(procs);
     let mut found = Vec::new();
     for pid in Kitty.host_pids(procs) {
-        let Ok(out) = Command::new("/usr/sbin/lsof")
-            .args(["-a", "-p", &pid.to_string(), "-U", "-Fn"])
-            .output()
-        else {
+        let Ok(out) = exec::output(
+            Command::new("/usr/sbin/lsof").args(["-a", "-p", &pid.to_string(), "-U", "-Fn"]),
+            None,
+            exec::QUICK,
+        ) else {
             continue;
         };
         let answering = String::from_utf8_lossy(&out.stdout)

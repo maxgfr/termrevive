@@ -1,5 +1,6 @@
 mod backend;
 mod capture;
+mod exec;
 mod harness;
 mod launchd;
 mod matcher;

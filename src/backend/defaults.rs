@@ -1,7 +1,8 @@
 //! macOS user defaults (`defaults read/write`), for apps configured that way.
 
 use super::Setting;
-use anyhow::{Context, Result, bail};
+use crate::exec;
+use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -12,10 +13,12 @@ pub const IGNORE_STATE: &str = "ApplePersistenceIgnoreState";
 
 /// `defaults read <domain> <key>`; `None` when unset.
 pub fn read(domain: &str, key: &str) -> Option<String> {
-    let out = Command::new("/usr/bin/defaults")
-        .args(["read", domain, key])
-        .output()
-        .ok()?;
+    let out = exec::output(
+        Command::new("/usr/bin/defaults").args(["read", domain, key]),
+        None,
+        exec::QUICK,
+    )
+    .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -24,10 +27,10 @@ pub fn read(domain: &str, key: &str) -> Option<String> {
 /// `defaults write <domain> <key> -bool true`; returns the file shown to the
 /// user for that domain.
 pub fn enable(domain: &str, key: &str) -> Result<PathBuf> {
-    let status = Command::new("/usr/bin/defaults")
-        .args(["write", domain, key, "-bool", "true"])
-        .status()
-        .context("running defaults")?;
+    let status = exec::status(
+        Command::new("/usr/bin/defaults").args(["write", domain, key, "-bool", "true"]),
+        exec::QUICK,
+    )?;
     if !status.success() {
         bail!("`defaults write {domain} {key}` failed");
     }

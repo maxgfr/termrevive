@@ -11,6 +11,7 @@ use crate::procs::Proc;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub struct SqliteHarness {
     name: &'static str,
@@ -78,10 +79,12 @@ fn sql_str(s: &str) -> String {
 
 fn query(db: &Path, sql: &str) -> Option<String> {
     let uri = format!("file:{}?mode=ro", db.display());
-    let out = Command::new("/usr/bin/sqlite3")
-        .args(["-readonly", "-json", &uri, sql])
-        .output()
-        .ok()?;
+    let out = crate::exec::output(
+        Command::new("/usr/bin/sqlite3").args(["-readonly", "-json", &uri, sql]),
+        None,
+        Duration::from_secs(5),
+    )
+    .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

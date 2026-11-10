@@ -1,8 +1,8 @@
 //! Helpers for backends driven through AppleScript (`osascript`).
 
-use anyhow::{Context, Result, bail};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use crate::exec;
+use anyhow::{Result, bail};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Field and record separators used by the read scripts.
@@ -22,21 +22,23 @@ on txt(v)
 end txt
 "#;
 
+/// How long a script that reads or probes may take. An app that stopped
+/// answering, or a permission prompt left unanswered, would otherwise hold
+/// `osascript` for as long as it lasts.
+const TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Runs `script` and returns its result, without the trailing newline.
 pub fn run(script: &str) -> Result<String> {
-    let mut child = Command::new("/usr/bin/osascript")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running osascript")?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(script.as_bytes())?;
-    let out = child.wait_with_output()?;
+    run_for(script, TIMEOUT)
+}
+
+/// The same for a script allowed `timeout`: a restore, with its pauses.
+pub fn run_for(script: &str, timeout: Duration) -> Result<String> {
+    let out = exec::output(
+        Command::new("/usr/bin/osascript").arg("-"),
+        Some(script),
+        timeout,
+    )?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-1743") {
@@ -100,10 +102,10 @@ pub fn delay(ms: u64) -> String {
 
 /// Starts the app with this bundle id (no-op if it runs).
 pub fn launch(bundle_id: &str) -> Result<()> {
-    let status = Command::new("/usr/bin/open")
-        .args(["-b", bundle_id])
-        .status()
-        .with_context(|| format!("launching {bundle_id}"))?;
+    let status = exec::status(
+        Command::new("/usr/bin/open").args(["-b", bundle_id]),
+        exec::QUICK,
+    )?;
     if !status.success() {
         bail!("`open -b {bundle_id}` failed");
     }

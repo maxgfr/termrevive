@@ -3,6 +3,7 @@
 //! launchd starts again every few minutes gets re-registered by macOS'
 //! Background Task Management on each launch, so it stays a single process.
 
+use crate::exec;
 use crate::store;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -121,19 +122,21 @@ fn domain() -> String {
 }
 
 fn loaded(label: &str) -> bool {
-    Command::new("/bin/launchctl")
-        .args(["print", &format!("{}/{label}", domain())])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    exec::status(
+        Command::new("/bin/launchctl").args(["print", &format!("{}/{label}", domain())]),
+        exec::QUICK,
+    )
+    .is_ok_and(|s| s.success())
 }
 
 /// Unloads `label` and waits until launchd has let go of it: `bootout`
 /// returns while a running job is still stopping, and bootstrapping the same
 /// label meanwhile fails with "Bootstrap failed: 5".
 fn bootout(label: &str) {
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &format!("{}/{label}", domain())])
-        .output();
+    let _ = exec::status(
+        Command::new("/bin/launchctl").args(["bootout", &format!("{}/{label}", domain())]),
+        exec::QUICK,
+    );
     for _ in 0..50 {
         if !loaded(label) {
             return;
@@ -147,11 +150,13 @@ fn install_one(label: &str, body: &str) -> Result<PathBuf> {
     fs::create_dir_all(path.parent().unwrap())?;
     bootout(label);
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    let out = Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain()])
-        .arg(&path)
-        .output()
-        .context("running launchctl")?;
+    let out = exec::output(
+        Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain()])
+            .arg(&path),
+        None,
+        exec::QUICK,
+    )?;
     if !out.status.success() {
         bail!(
             "launchctl bootstrap {} failed: {}",
@@ -207,11 +212,14 @@ fn parse_agent_args(args: &[String]) -> Option<AgentConfig> {
 /// The installed agent's configuration, read back from its plist.
 pub fn agent_config() -> Option<AgentConfig> {
     let path = plist_path(AGENT_LABEL).ok().filter(|p| p.exists())?;
-    let out = Command::new("/usr/bin/plutil")
-        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
-        .arg(&path)
-        .output()
-        .ok()?;
+    let out = exec::output(
+        Command::new("/usr/bin/plutil")
+            .args(["-extract", "ProgramArguments", "json", "-o", "-"])
+            .arg(&path),
+        None,
+        exec::QUICK,
+    )
+    .ok()?;
     let args: Vec<String> = serde_json::from_slice(&out.stdout).ok()?;
     parse_agent_args(&args)
 }
