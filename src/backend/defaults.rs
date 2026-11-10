@@ -1,7 +1,14 @@
 //! macOS user defaults (`defaults read/write`), for apps configured that way.
 
+use super::Setting;
 use anyhow::{Context, Result, bail};
+use std::path::PathBuf;
 use std::process::Command;
+
+/// Cocoa's own window restoration, which every AppKit app honors: with this set,
+/// the app ignores its saved windows at launch, so they don't come back on top
+/// of a restore.
+pub const IGNORE_STATE: &str = "ApplePersistenceIgnoreState";
 
 /// `defaults read <domain> <key>`; `None` when unset.
 pub fn read(domain: &str, key: &str) -> Option<String> {
@@ -14,33 +21,30 @@ pub fn read(domain: &str, key: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `defaults write <domain> <key> -bool <value>`.
-pub fn write_bool(domain: &str, key: &str, value: bool) -> Result<()> {
+/// `defaults write <domain> <key> -bool true`; returns the file shown to the
+/// user for that domain.
+pub fn enable(domain: &str, key: &str) -> Result<PathBuf> {
     let status = Command::new("/usr/bin/defaults")
-        .args([
-            "write",
-            domain,
-            key,
-            "-bool",
-            if value { "true" } else { "false" },
-        ])
+        .args(["write", domain, key, "-bool", "true"])
         .status()
         .context("running defaults")?;
     if !status.success() {
         bail!("`defaults write {domain} {key}` failed");
     }
-    Ok(())
-}
-
-/// Path shown to the user for a defaults domain.
-pub fn plist_path(domain: &str) -> std::path::PathBuf {
-    dirs::home_dir()
+    Ok(dirs::home_dir()
         .unwrap_or_default()
         .join("Library/Preferences")
-        .join(format!("{domain}.plist"))
+        .join(format!("{domain}.plist")))
 }
 
-/// Cocoa's own window restoration, which every AppKit app honors: with this set,
-/// the app ignores its saved windows at launch, so they don't come back on top
-/// of a restore.
-pub const IGNORE_STATE: &str = "ApplePersistenceIgnoreState";
+/// The [`IGNORE_STATE`] setting of the app `domain`, as `doctor` shows it.
+pub fn ignore_state(domain: &str, why: &'static str) -> Setting {
+    let current = read(domain, IGNORE_STATE);
+    Setting {
+        name: IGNORE_STATE,
+        ok: current.as_deref() == Some("1"),
+        current,
+        wanted: "1",
+        why,
+    }
+}

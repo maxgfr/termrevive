@@ -165,10 +165,7 @@ impl Backend for Terminal {
     }
 
     fn host_pids(&self, procs: &[Proc]) -> Vec<i32> {
-        procs::find_by_exe(procs, EXE_SUFFIX)
-            .iter()
-            .map(|p| p.pid)
-            .collect()
+        procs::pids_by_exe(procs, EXE_SUFFIX)
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
@@ -188,23 +185,11 @@ tell application "Terminal" to count windows"#,
     }
 
     fn blank_windows(&self) -> Result<Vec<String>> {
-        Ok(osa::run(BLANK_SCRIPT)?
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect())
+        osa::lines(BLANK_SCRIPT)
     }
 
     fn close_windows(&self, ids: &[String]) -> Result<()> {
-        let body: String = ids
-            .iter()
-            .filter(|id| id.parse::<i64>().is_ok())
-            .map(|id| format!("\ttry\n\t\tclose (first window whose id is {id})\n\tend try\n"))
-            .collect();
-        if body.is_empty() {
-            return Ok(());
-        }
-        osa::run(&format!("tell application \"Terminal\"\n{body}end tell")).map(drop)
+        osa::close_windows("Terminal", ids)
     }
 
     fn restore_script(&self, window: &WindowPlan, delay_ms: u64) -> String {
@@ -219,19 +204,14 @@ tell application "Terminal" to count windows"#,
     }
 
     fn settings(&self) -> Vec<Setting> {
-        let current = defaults::read(BUNDLE, defaults::IGNORE_STATE);
-        vec![Setting {
-            name: defaults::IGNORE_STATE,
-            ok: current.as_deref() == Some("1"),
-            current,
-            wanted: "1",
-            why: "macOS reopens Terminal.app's own windows at launch, on top of a restore",
-        }]
+        vec![defaults::ignore_state(
+            BUNDLE,
+            "macOS reopens Terminal.app's own windows at launch, on top of a restore",
+        )]
     }
 
     fn apply_setting(&self, setting: &Setting) -> Result<PathBuf> {
-        defaults::write_bool(BUNDLE, setting.name, true)?;
-        Ok(defaults::plist_path(BUNDLE))
+        defaults::enable(BUNDLE, setting.name)
     }
 }
 

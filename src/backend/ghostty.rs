@@ -116,10 +116,7 @@ impl Backend for Ghostty {
     }
 
     fn host_pids(&self, procs: &[Proc]) -> Vec<i32> {
-        procs::find_by_exe(procs, EXE_SUFFIX)
-            .iter()
-            .map(|p| p.pid)
-            .collect()
+        procs::pids_by_exe(procs, EXE_SUFFIX)
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
@@ -137,11 +134,7 @@ impl Backend for Ghostty {
     }
 
     fn blank_windows(&self) -> Result<Vec<String>> {
-        Ok(osa::run(BLANK_SCRIPT)?
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect())
+        osa::lines(BLANK_SCRIPT)
     }
 
     fn close_windows(&self, ids: &[String]) -> Result<()> {

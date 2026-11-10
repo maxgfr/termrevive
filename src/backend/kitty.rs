@@ -245,10 +245,7 @@ impl Backend for Kitty {
     }
 
     fn host_pids(&self, procs: &[Proc]) -> Vec<i32> {
-        procs::find_by_exe(procs, EXE_SUFFIX)
-            .iter()
-            .map(|p| p.pid)
-            .collect()
+        procs::pids_by_exe(procs, EXE_SUFFIX)
     }
 
     fn read_layout(&self, procs: &[Proc]) -> Result<RawLayout> {

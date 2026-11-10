@@ -64,11 +64,19 @@ pub fn basename(path: &str) -> &str {
     name.strip_prefix('-').unwrap_or(name)
 }
 
-/// PIDs of the processes whose executable path ends with `exe_suffix`.
+/// The processes whose executable path ends with `exe_suffix`.
 pub fn find_by_exe<'a>(procs: &'a [Proc], exe_suffix: &str) -> Vec<&'a Proc> {
     procs
         .iter()
         .filter(|p| p.comm.ends_with(exe_suffix))
+        .collect()
+}
+
+/// Their pids: what a backend's `host_pids` returns.
+pub fn pids_by_exe(procs: &[Proc], exe_suffix: &str) -> Vec<i32> {
+    find_by_exe(procs, exe_suffix)
+        .iter()
+        .map(|p| p.pid)
         .collect()
 }
 
@@ -271,10 +279,7 @@ mod tests {
     #[test]
     fn finds_shells_and_foreground_jobs() {
         let procs = parse_ps(PS);
-        let ghostty: Vec<i32> = find_by_exe(&procs, "/ghostty")
-            .iter()
-            .map(|p| p.pid)
-            .collect();
+        let ghostty = pids_by_exe(&procs, "/ghostty");
         assert_eq!(ghostty, vec![8185]);
         let s = tty_sessions(&procs, &ghostty);
         assert_eq!(s.len(), 2);

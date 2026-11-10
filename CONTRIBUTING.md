@@ -28,9 +28,11 @@ LaunchAgents, `doctor` — is shared and needs no change.
    - `settings` / `apply_setting` cover what must hold for a restore (usually:
      the terminal must not reopen its own windows at launch). `doctor` shows
      them and `doctor --fix` applies them.
-   - Shared helpers: `applescript.rs` (`run`, `str` escaping, `delay`,
-     `launch`, `wait_ready`, `records`), `conf.rs` (`key value` / `key = value`
-     config files), `defaults.rs` (`defaults read/write`).
+   - Shared helpers: `applescript.rs` (`run`, `lines`, `str` escaping, `delay`,
+     `launch`, `wait_ready`, `records`, `close_windows`), `conf.rs`
+     (`key value` / `key = value` config files), `defaults.rs` (`defaults
+     read/write`, the `ApplePersistenceIgnoreState` setting), and
+     `procs::pids_by_exe` for `host_pids`.
 3. **Register it**: one line in `registry()` in `src/backend/mod.rs`.
 4. **Test it** with fixtures, no terminal needed: parse a captured read output
    (AppleScript records or JSON) into a `RawLayout`, and check the restore

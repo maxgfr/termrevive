@@ -55,6 +55,34 @@ pub fn run(script: &str) -> Result<String> {
     Ok(s)
 }
 
+/// Runs `script` and returns the non-empty lines of its result.
+pub fn lines(script: &str) -> Result<Vec<String>> {
+    Ok(run(script)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// The script closing the windows of `app` that have these ids, if any. Only
+/// numeric ids are used: they go into the script as they are.
+fn close_script(app: &str, ids: &[String]) -> Option<String> {
+    let body: String = ids
+        .iter()
+        .filter(|id| id.parse::<i64>().is_ok())
+        .map(|id| format!("\ttry\n\t\tclose (first window whose id is {id})\n\tend try\n"))
+        .collect();
+    (!body.is_empty()).then(|| format!("tell application {}\n{body}end tell", str(app)))
+}
+
+/// Closes the windows of `app` that have these (numeric) ids.
+pub fn close_windows(app: &str, ids: &[String]) -> Result<()> {
+    match close_script(app, ids) {
+        Some(script) => run(&script).map(drop),
+        None => Ok(()),
+    }
+}
+
 /// An AppleScript string expression for `s`.
 pub fn str(s: &str) -> String {
     let body = s
@@ -121,6 +149,20 @@ mod tests {
     fn escapes_strings() {
         assert_eq!(str(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(str("x\ny"), "\"x\" & linefeed & \"y\"");
+    }
+
+    #[test]
+    fn closes_windows_by_numeric_id_only() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            close_script("iTerm2", &ids(&["12", "x\" & quit", "7"])).unwrap(),
+            "tell application \"iTerm2\"\n\
+             \ttry\n\t\tclose (first window whose id is 12)\n\tend try\n\
+             \ttry\n\t\tclose (first window whose id is 7)\n\tend try\n\
+             end tell"
+        );
+        assert_eq!(close_script("Terminal", &ids(&["/dev/ttys001"])), None);
+        assert_eq!(close_script("Terminal", &[]), None);
     }
 
     #[test]
