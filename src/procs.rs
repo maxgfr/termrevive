@@ -1,18 +1,21 @@
 //! Process-table inspection (macOS): which shells live under a terminal emulator,
-//! what runs in their foreground, and where.
+//! what runs in their foreground, and where. Everything is asked from the
+//! kernel (libproc, sysctl): no `ps`, which costs a process per save.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proc {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
+    /// Foreground process group of its terminal; 0 without one.
     pub tpgid: i32,
-    /// `ttys004`, or `??` when detached.
+    /// `ttys004`, or `??`: detached, or a process of another user (`login`,
+    /// which root owns), whose terminal the kernel does not tell.
     pub tty: String,
+    /// Path of the executable; its short name when the path cannot be read.
     pub comm: String,
 }
 
@@ -25,18 +28,124 @@ pub struct TtySession {
     pub fg: Option<Proc>,
 }
 
-pub fn process_table() -> Result<Vec<Proc>> {
-    let out = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,pgid=,tpgid=,tty=,comm="])
-        .output()
-        .context("running ps")?;
-    if !out.status.success() {
-        bail!("ps failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(parse_ps(&String::from_utf8_lossy(&out.stdout)))
+unsafe extern "C" {
+    /// `<stdlib.h>`: the name of a device, written into `buf`.
+    fn devname_r(
+        dev: libc::dev_t,
+        kind: libc::mode_t,
+        buf: *mut libc::c_char,
+        len: libc::c_int,
+    ) -> *mut libc::c_char;
 }
 
-fn parse_ps(text: &str) -> Vec<Proc> {
+/// `proc_pidinfo` for a flavor with a fixed-size answer; `None` when the
+/// process is gone or the kernel refuses (another user's process).
+///
+/// # Safety
+/// `T` must be the C struct that `flavor` fills.
+unsafe fn pidinfo<T>(pid: i32, flavor: libc::c_int) -> Option<T> {
+    // SAFETY: these structs are plain data, valid when zeroed, and the kernel
+    // writes at most `size` bytes into `info`.
+    let mut info: T = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<T>() as libc::c_int;
+    let n = unsafe { libc::proc_pidinfo(pid, flavor, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some(info)
+}
+
+/// The text of a NUL-terminated C array.
+fn c_str(chars: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn exe_path(pid: i32) -> Option<String> {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most the length it is given.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// `ttys004` for a terminal's device number, as `ps` prints it.
+fn tty_name(dev: u32) -> String {
+    let mut buf = [0 as libc::c_char; 64];
+    // SAFETY: devname_r writes a NUL-terminated name of at most `len` bytes.
+    let found = unsafe {
+        devname_r(
+            dev as libc::dev_t,
+            libc::S_IFCHR,
+            buf.as_mut_ptr(),
+            buf.len() as libc::c_int,
+        )
+    };
+    let name = c_str(&buf);
+    if dev == u32::MAX || found.is_null() || name.is_empty() {
+        "??".into()
+    } else {
+        name
+    }
+}
+
+fn proc_of(pid: i32, ttys: &mut HashMap<u32, String>) -> Option<Proc> {
+    // SAFETY: proc_bsdinfo is what PROC_PIDTBSDINFO fills.
+    if let Some(i) = unsafe { pidinfo::<libc::proc_bsdinfo>(pid, libc::PROC_PIDTBSDINFO) } {
+        return Some(Proc {
+            pid,
+            ppid: i.pbi_ppid as i32,
+            pgid: i.pbi_pgid as i32,
+            tpgid: i.e_tpgid as i32,
+            tty: ttys
+                .entry(i.e_tdev)
+                .or_insert_with(|| tty_name(i.e_tdev))
+                .clone(),
+            comm: exe_path(pid).unwrap_or_else(|| c_str(&i.pbi_comm)),
+        });
+    }
+    // Another user's process: the kernel only tells its lineage and its name.
+    // SAFETY: proc_bsdshortinfo is what PROC_PIDT_SHORTBSDINFO fills.
+    let i = unsafe { pidinfo::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO) }?;
+    Some(Proc {
+        pid,
+        ppid: i.pbsi_ppid as i32,
+        pgid: i.pbsi_pgid as i32,
+        tpgid: 0,
+        tty: "??".into(),
+        comm: exe_path(pid).unwrap_or_else(|| c_str(&i.pbsi_comm)),
+    })
+}
+
+/// Every process, lowest pid first.
+pub fn process_table() -> Result<Vec<Proc>> {
+    // SAFETY: a null buffer asks how many processes there are.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        bail!("could not list the processes");
+    }
+    // Room for those that start in between.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: at most `bytes` bytes are written into `pids`.
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if count <= 0 {
+        bail!("could not list the processes");
+    }
+    pids.truncate(count as usize);
+    pids.sort_unstable();
+    let mut ttys = HashMap::new();
+    Ok(pids
+        .into_iter()
+        .filter(|&pid| pid > 0)
+        .filter_map(|pid| proc_of(pid, &mut ttys))
+        .collect())
+}
+
+/// A table in the format of `ps -axo pid=,ppid=,pgid=,tpgid=,tty=,comm=`,
+/// which the fixtures use.
+#[cfg(test)]
+pub fn parse_ps(text: &str) -> Vec<Proc> {
     text.lines()
         .filter_map(|line| {
             let mut rest = line.trim_start();
@@ -84,7 +193,7 @@ pub fn pids_by_exe(procs: &[Proc], exe_suffix: &str) -> Vec<i32> {
 pub fn tty_sessions(procs: &[Proc], parents: &[i32]) -> Vec<TtySession> {
     let mut sessions: Vec<TtySession> = procs
         .iter()
-        .filter(|p| parents.contains(&p.ppid) && p.tty != "??")
+        .filter(|p| parents.contains(&p.ppid))
         .filter_map(|top| session_from(procs, top))
         .collect();
     sessions.sort_by(|a, b| a.tty.cmp(&b.tty));
@@ -103,13 +212,16 @@ pub fn session_on_tty(procs: &[Proc], tty: &str) -> Option<TtySession> {
 }
 
 fn session_from(procs: &[Proc], top: &Proc) -> Option<TtySession> {
+    // `login` belongs to root, so its own terminal is not known: the shell is
+    // its child that has one.
     let shell = if basename(&top.comm) == "login" {
-        procs
-            .iter()
-            .find(|p| p.ppid == top.pid && p.tty == top.tty)?
+        procs.iter().find(|p| p.ppid == top.pid && p.tty != "??")?
     } else {
         top
     };
+    if shell.tty == "??" {
+        return None;
+    }
     let fg = (shell.tpgid > 0 && shell.tpgid != shell.pgid)
         .then(|| {
             procs
@@ -131,33 +243,13 @@ fn session_from(procs: &[Proc], top: &Proc) -> Option<TtySession> {
     })
 }
 
-/// Current working directory of `pid`, asked from the kernel (libproc);
-/// `None` when the process is gone or belongs to another user.
+/// Current working directory of `pid`; `None` when the process is gone or
+/// belongs to another user.
 pub fn cwd(pid: i32) -> Option<String> {
-    // SAFETY: zeroed is a valid proc_vnodepathinfo; proc_pidinfo writes at most `size` bytes.
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    if n != size {
-        return None;
-    }
-    let path: Vec<u8> = info
-        .pvi_cdir
-        .vip_path
-        .as_flattened()
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    (!path.is_empty()).then(|| String::from_utf8_lossy(&path).into_owned())
+    // SAFETY: proc_vnodepathinfo is what PROC_PIDVNODEPATHINFO fills.
+    let info: libc::proc_vnodepathinfo = unsafe { pidinfo(pid, libc::PROC_PIDVNODEPATHINFO) }?;
+    let path = c_str(info.pvi_cdir.vip_path.as_flattened());
+    (!path.is_empty()).then_some(path)
 }
 
 /// Current working directories of `pids`; those that cannot be read are left out.
@@ -222,12 +314,9 @@ fn parse_procargs(buf: &[u8]) -> Option<Vec<String>> {
 
 /// Seconds since the epoch at which `pid` started.
 pub fn start_time(pid: i32) -> Option<i64> {
-    // SAFETY: zeroed is a valid proc_bsdinfo; proc_pidinfo writes at most `size` bytes.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    (n == size).then_some(info.pbi_start_tvsec as i64)
+    // SAFETY: proc_bsdinfo is what PROC_PIDTBSDINFO fills.
+    let info: libc::proc_bsdinfo = unsafe { pidinfo(pid, libc::PROC_PIDTBSDINFO) }?;
+    Some(info.pbi_start_tvsec as i64)
 }
 
 /// Seconds since the epoch at which the machine booted.
@@ -253,6 +342,7 @@ pub fn boot_time() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     const PS: &str = "\
  8185     1  8185     0 ??       /Applications/Ghostty.app/Contents/MacOS/ghostty
@@ -296,6 +386,51 @@ mod tests {
         assert_eq!(s.shell_pid, 46087);
         assert_eq!(s.fg.map(|p| p.pid), Some(46274));
         assert!(session_on_tty(&procs, "ttys009").is_none());
+    }
+
+    /// What `login` looks like from the kernel: root owns it, so no terminal.
+    #[test]
+    fn finds_the_shell_under_a_login_whose_terminal_is_unknown() {
+        let mut procs = parse_ps(PS);
+        for p in procs.iter_mut().filter(|p| p.comm == "/usr/bin/login") {
+            p.tty = "??".into();
+            p.tpgid = 0;
+        }
+        let s = tty_sessions(&procs, &[8185]);
+        assert_eq!(
+            s.iter().map(|s| s.shell_pid).collect::<Vec<_>>(),
+            vec![46087, 91580]
+        );
+        assert_eq!(s[0].fg.as_ref().map(|p| p.pid), Some(46274));
+        let s = session_on_tty(&procs, "ttys008").unwrap();
+        assert_eq!((s.shell_pid, s.fg), (91580, None));
+        // A child of the emulator that has no terminal is no session.
+        assert!(tty_sessions(&procs, &[1]).is_empty());
+    }
+
+    #[test]
+    fn the_process_table_agrees_with_ps() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let table = process_table().unwrap();
+        let ps = Command::new("/bin/ps")
+            .args(["-o", "pid=,ppid=,pgid=,tpgid=,tty=,comm="])
+            .args(["-p", &child.id().to_string()])
+            .output()
+            .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let want = parse_ps(&String::from_utf8_lossy(&ps.stdout)).remove(0);
+        let got = table.iter().find(|p| p.pid == want.pid).unwrap();
+        assert_eq!(
+            (got.ppid, got.pgid, got.tpgid, &got.tty),
+            (want.ppid, want.pgid, want.tpgid, &want.tty)
+        );
+        assert_eq!(got.ppid, std::process::id() as i32);
+        assert_eq!(got.comm, "/bin/sleep");
+        // launchd is root's: listed all the same, with its path.
+        let launchd = table.iter().find(|p| p.pid == 1).unwrap();
+        assert_eq!((launchd.ppid, launchd.comm.as_str()), (0, "/sbin/launchd"));
+        assert!(table.windows(2).all(|w| w[0].pid < w[1].pid));
     }
 
     #[test]
