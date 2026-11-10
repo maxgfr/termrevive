@@ -15,7 +15,39 @@ const BUNDLE: &str = "com.mitchellh.ghostty";
 const EXE_SUFFIX: &str = "Ghostty.app/Contents/MacOS/ghostty";
 const SAVE_STATE: &str = "window-save-state";
 
+/// Reads a window in five Apple events, whatever it holds: each property is
+/// asked for all the tabs, or for all the terminals of all the tabs, at once.
+/// Ghostty takes about 10 ms per event, and asking pane by pane cost a second
+/// for 14 tabs.
 const READ_SCRIPT: &str = r#"
+set US to character id 31
+set RS to character id 30
+set out to ""
+tell application "Ghostty"
+	repeat with w in windows
+		set out to out & "W" & US & (id of w) & RS
+		set tabSelected to selected of tabs of w
+		set tabNames to name of tabs of w
+		set termIds to id of terminals of tabs of w
+		set termNames to name of terminals of tabs of w
+		set termDirs to working directory of terminals of tabs of w
+		set n to count of tabNames
+		if (count of tabSelected) is not n or (count of termIds) is not n or (count of termNames) is not n or (count of termDirs) is not n then error "the tabs changed while they were read"
+		repeat with ti from 1 to n
+			set out to out & "T" & US & my txt(item ti of tabSelected) & US & my txt(item ti of tabNames) & RS
+			repeat with si from 1 to count of (item ti of termIds)
+				set out to out & "S" & US & (item si of item ti of termIds) & US & my txt(item si of item ti of termNames) & US & my txt(item si of item ti of termDirs) & RS
+			end repeat
+		end repeat
+	end repeat
+end tell
+return out
+"#;
+
+/// The same read, one tab and one terminal at a time. Slower, and used when
+/// the read above fails: a tab opened or closed between two of its events, or
+/// a Ghostty that does not answer for several tabs at once.
+const READ_SCRIPT_STEPWISE: &str = r#"
 set US to character id 31
 set RS to character id 30
 set out to ""
@@ -120,10 +152,9 @@ impl Backend for Ghostty {
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
-        Ok(parse_layout(&osa::run(&format!(
-            "{}{READ_SCRIPT}",
-            osa::TXT_HANDLER
-        ))?))
+        let read = |script: &str| osa::run(&format!("{}{script}", osa::TXT_HANDLER));
+        let text = read(READ_SCRIPT).or_else(|_| read(READ_SCRIPT_STEPWISE))?;
+        Ok(parse_layout(&text))
     }
 
     fn ensure_running(&self) -> Result<()> {
