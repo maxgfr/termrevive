@@ -9,10 +9,16 @@ use super::{AgentProc, Harness};
 use crate::model::AgentSession;
 use crate::procs::Proc;
 use serde::Deserialize;
+use std::cell::OnceCell;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-pub struct Codex;
+#[derive(Default)]
+pub struct Codex {
+    /// The active threads, listed once per capture: finding them walks every
+    /// day of `sessions/`, and each Codex pane asks.
+    threads: OnceCell<Vec<Thread>>,
+}
 
 #[derive(Deserialize)]
 struct Line {
@@ -62,11 +68,15 @@ fn rollouts(home: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        paths.reverse();
-        for p in paths {
-            if depth < 3 && p.is_dir() {
+        let mut entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+        for e in entries {
+            let p = e.path();
+            // The entry's own type spares a stat per file; a link is followed.
+            let is_dir = e
+                .file_type()
+                .is_ok_and(|t| t.is_dir() || (t.is_symlink() && p.is_dir()));
+            if depth < 3 && is_dir {
                 walk(&p, depth + 1, out);
             } else if p.extension().is_some_and(|x| x == "jsonl") {
                 out.push(p);
@@ -96,22 +106,23 @@ fn active_threads(home: &Path) -> Vec<Thread> {
     if ids.is_empty() {
         return Vec::new();
     }
+    let suffixes: Vec<String> = ids.iter().map(|id| format!("-{id}.jsonl")).collect();
     rollouts(home)
         .iter()
         .filter(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy();
-            ids.iter().any(|id| name.ends_with(&format!("-{id}.jsonl")))
+            suffixes.iter().any(|s| name.ends_with(s.as_str()))
         })
         .filter_map(|p| read_meta(p))
         .collect()
 }
 
 /// Threads of `p`'s directory, the one created closest to `p`'s start first.
-fn rank(threads: Vec<Thread>, p: &AgentProc) -> Vec<Thread> {
+fn rank(threads: &[Thread], p: &AgentProc) -> Vec<Thread> {
     let Some(cwd) = &p.cwd else {
         return Vec::new();
     };
-    let mut matching: Vec<Thread> = threads.into_iter().filter(|t| &t.cwd == cwd).collect();
+    let mut matching: Vec<Thread> = threads.iter().filter(|t| &t.cwd == cwd).cloned().collect();
     matching.sort_by_key(|t| match (t.created, p.started) {
         (Some(c), Some(s)) => (c - s).abs(),
         _ => i64::MAX,
@@ -144,10 +155,10 @@ impl Harness for Codex {
     }
 
     fn sessions(&self, p: &AgentProc, _procs: &[Proc]) -> Vec<AgentSession> {
-        let Some(home) = home() else {
-            return Vec::new();
-        };
-        rank(active_threads(&home), p)
+        let threads = self
+            .threads
+            .get_or_init(|| home().map(|h| active_threads(&h)).unwrap_or_default());
+        rank(threads, p)
             .into_iter()
             .map(|t| AgentSession {
                 harness: self.name().into(),
@@ -249,10 +260,22 @@ mod tests {
             cwd: Some("/w".into()),
             started: Some(started),
         };
-        assert!(Codex.is_cli(&p));
-        let ids: Vec<String> = rank(threads, &p).into_iter().map(|t| t.id).collect();
+        assert!(Codex::default().is_cli(&p));
+        let ids: Vec<String> = rank(&threads, &p).into_iter().map(|t| t.id).collect();
         assert_eq!(ids, vec!["B", "A"]);
         let _ = std::fs::remove_dir_all(&home);
+
+        // Once listed, the threads serve every pane of the capture: nothing
+        // is read again, here not even with the files gone.
+        let codex = Codex {
+            threads: OnceCell::from(threads),
+        };
+        let ids: Vec<String> = codex
+            .sessions(&p, &[])
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, vec!["B", "A"]);
     }
 
     #[test]
@@ -265,6 +288,6 @@ mod tests {
             cwd: None,
             started: None,
         };
-        assert!(!Codex.is_cli(&p));
+        assert!(!Codex::default().is_cli(&p));
     }
 }

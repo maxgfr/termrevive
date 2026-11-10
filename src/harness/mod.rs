@@ -93,7 +93,7 @@ pub fn flag_value(argv: &[String], flags: &[&str]) -> Option<String> {
 pub fn registry() -> Vec<Box<dyn Harness>> {
     vec![
         Box::new(claude::Claude),
-        Box::new(codex::Codex),
+        Box::new(codex::Codex::default()),
         Box::new(vibe::Vibe),
         Box::new(sqlite::opencode()),
         Box::new(sqlite::kilo()),
