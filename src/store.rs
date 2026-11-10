@@ -2,8 +2,10 @@
 //! to `<state>/latest.json`, plus the small marker files used by auto mode.
 
 use crate::model::Snapshot;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 const KEEP: usize = 30;
@@ -90,32 +92,95 @@ pub fn mark_restored(boot: i64) -> Result<()> {
     Ok(())
 }
 
-/// Held while a restore runs so auto-save does not record a half-built layout.
-pub struct RestoreLock(PathBuf);
+/// Held while a restore runs, so auto-save does not record a half-built layout
+/// and two restores never run at once. It is an advisory lock (`flock`) on
+/// `restoring.pid`: the kernel releases it when the process ends, however it
+/// ends, so an interrupted restore cannot leave it behind.
+pub struct RestoreLock(fs::File);
+
+fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("restoring.pid")
+}
+
+fn try_lock(file: &fs::File) -> bool {
+    // SAFETY: the descriptor stays open for the duration of the call.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
 
 impl RestoreLock {
     pub fn acquire() -> Result<RestoreLock> {
-        fs::create_dir_all(state_dir())?;
-        let path = state_dir().join("restoring.pid");
-        fs::write(&path, std::process::id().to_string())?;
-        Ok(RestoreLock(path))
+        Self::acquire_in(&state_dir())
     }
 
-    /// Whether another live process is restoring right now.
+    fn acquire_in(dir: &Path) -> Result<RestoreLock> {
+        fs::create_dir_all(dir)?;
+        let path = lock_path(dir);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // An auto-save checking the lock holds it for an instant: retry briefly.
+        let mut tries = 0;
+        while !try_lock(&file) {
+            tries += 1;
+            if tries == 10 {
+                bail!("another restore is running ({})", path.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The pid is informative; agents of termrevive ≤ 1.3.0 still read it.
+        file.set_len(0)?;
+        write!(file, "{}", std::process::id())?;
+        Ok(RestoreLock(file))
+    }
+
+    /// Whether a restore is running right now.
     pub fn held() -> bool {
-        let Ok(pid) = fs::read_to_string(state_dir().join("restoring.pid")) else {
-            return false;
-        };
-        let Ok(pid) = pid.trim().parse::<i32>() else {
-            return false;
-        };
-        // SAFETY: signal 0 only checks that the process exists.
-        unsafe { libc::kill(pid, 0) == 0 }
+        Self::held_in(&state_dir())
+    }
+
+    fn held_in(dir: &Path) -> bool {
+        // Taking the lock proves nobody holds it; closing the file gives it back.
+        fs::File::open(lock_path(dir)).is_ok_and(|file| !try_lock(&file))
     }
 }
 
 impl Drop for RestoreLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Emptied, not removed: unlinking a lock file would let another
+        // process lock a new file of the same name while this one is held.
+        let _ = self.0.set_len(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_lock_is_exclusive_and_ends_with_its_holder() {
+        let dir = std::env::temp_dir().join(format!("termrevive-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!RestoreLock::held_in(&dir), "no lock file yet");
+
+        // What an interrupted restore of termrevive ≤ 1.3.0 leaves behind: a
+        // file naming a pid that is alive (here, ours). It is not a lock.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(lock_path(&dir), std::process::id().to_string()).unwrap();
+        assert!(!RestoreLock::held_in(&dir));
+
+        let lock = RestoreLock::acquire_in(&dir).unwrap();
+        assert!(RestoreLock::held_in(&dir));
+        assert!(
+            RestoreLock::acquire_in(&dir).is_err(),
+            "a second restore is refused"
+        );
+        drop(lock);
+        assert!(!RestoreLock::held_in(&dir));
+        assert!(RestoreLock::acquire_in(&dir).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
