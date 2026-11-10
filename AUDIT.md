@@ -9,9 +9,9 @@ each running an agent session.
 - The codebase is small (about 4 800 lines, 8 direct dependencies), consistently
   structured (one file per terminal, one per agent CLI) and its parsers and
   script generators were already tested; fmt, clippy and the 49 tests passed.
-- No critical defect in the code; the one critical finding is around it: CI and
-  the release can no longer run (retired runner image, see below). Nine bugs sat
-  in edge paths: the restore lock, rule rendering and quoting, the agent's
+- No critical defect in the code; the one critical finding was around it: CI and
+  the release could no longer run (retired runner image, fixed, see below). Nine
+  bugs sat in edge paths: the restore lock, rule rendering and quoting, the agent's
   environment, non-ASCII directories, stale Claude Code registry entries.
 - All nine are fixed, eight with a regression test (49 → 56 tests).
 - A save was dominated by one thing, the Ghostty read script: a whole
@@ -89,27 +89,27 @@ Measured and not done, the gain being too small for the code it needs:
 6. Ghostty is read with a different AppleScript, checked on Ghostty 1.4.0 only;
    older versions fall back to the previous script if it fails.
 
-These commits are on `main` but not released: see the critical finding below.
+All of it is released as v1.3.1.
+
+## CI and release: the runner image was retired
+
+Both workflows pinned `runs-on: macos-14` (`ci.yml`, job `rust`; `release.yml`,
+both entries of the build matrix), and GitHub retired every macOS 14 image from
+Actions on 2026-11-02. The run started by this audit's first push was cancelled
+within two seconds, before any step, with "The configuration
+'macos-14-arm64-us-default' is not supported"; a re-run ended the same way.
+Nothing pushed since that date was checked or released.
+
+Workflows were out of this audit's scope; the change was made once the owner
+asked for it: `macos-14` → `macos-15` in the three places (`bf0bfb4`). The run
+that followed passed CI, built both targets (x86_64 included, which could not
+be built locally) and published v1.3.1.
 
 ## Found, not fixed
 
 ### Critical
 
-1. **CI and the release cannot run: `macos-14` is gone.** Both workflows pin
-   `runs-on: macos-14` (`ci.yml`, job `rust`; `release.yml`, both entries of the
-   build matrix). GitHub retired every macOS 14 image from Actions on
-   2026-11-02. The run started by this audit's push was cancelled within two
-   seconds, before any step, with "The configuration
-   'macos-14-arm64-us-default' is not supported"; a re-run ended the same way.
-   So nothing pushed since that date is checked by CI, and no release is
-   published: the commits of this audit were verified locally only (fmt,
-   clippy, tests and a release build on arm64; the x86_64 build was not, the
-   target not being installed here).
-   Recommendation: replace `macos-14` with `macos-15` (arm64, like `macos-14`
-   was) in the three places. The workflows were left alone, deployment
-   configuration being out of this audit's scope. Once fixed, the next push to
-   `main`, or a manual run of the Release workflow, releases everything since
-   v1.3.0 as one patch version.
+None.
 
 ### Important
 
@@ -172,8 +172,8 @@ These commits are on `main` but not released: see the critical finding below.
 
 ## Open questions
 
-1. **The runner image** (Critical 1): `macos-15`, or `macos-latest` to stop
-   pinning a version that gets retired?
+1. **The runner image**: now pinned to `macos-15`, which will be retired in its
+   turn. Keep pinning, or use `macos-latest`?
 2. **A user rule matching an agent with no `cwd`** runs in the pane's shell
    directory, not the session's. `claude --resume` needs the session's project
    directory, so a rule that only changes the command breaks sessions living in
