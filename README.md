@@ -89,7 +89,8 @@ trigger it each time; `install` replaces them).
 
 - Auto-save writes only when something changed, never while a restore runs,
   never when no terminal runs, and — when auto-restore is on — not after a
-  reboot until that boot's restore has happened, so a fresh empty terminal
+  reboot until that boot's restore has happened (the automatic one, or a
+  `termrevive restore` of the whole snapshot), so a fresh empty terminal
   can't overwrite the snapshot you want back. A terminal that runs but cannot
   be read keeps its windows from the previous snapshot.
 - Auto-restore runs at login, only from a snapshot of a previous boot, once per

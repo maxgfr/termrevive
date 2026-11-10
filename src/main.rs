@@ -376,6 +376,11 @@ fn plan(windows: &[&Window], cfg: &Config, caps: Caps) -> Vec<WindowPlan> {
         .collect()
 }
 
+/// Whether restoring the terminals `names` brings back all of `snap`.
+fn covers(snap: &Snapshot, names: &[String]) -> bool {
+    snap.backends().iter().all(|b| names.contains(b))
+}
+
 /// Panes currently open in `b`.
 fn open_panes(b: &dyn Backend) -> Result<usize> {
     Ok(b.read_layout(&procs::process_table()?)?
@@ -503,7 +508,9 @@ fn restore(
             failures.push(b.display_name());
         }
     }
-    if auto {
+    // A manual restore of the whole snapshot is this boot's restore too:
+    // auto-save may go on, and the agent has nothing left to restore.
+    if auto || covers(&snap, &names) {
         store::mark_restored(boot)?;
     }
     if !failures.is_empty() {
@@ -688,6 +695,23 @@ mod tests {
             &win("✳ fix-bug", "/b")
         ));
         assert!(!same_layout(&win("✳ fix-bug", "/a"), &win("✳ other", "/a")));
+    }
+
+    #[test]
+    fn only_a_restore_of_every_terminal_covers_the_snapshot() {
+        let mut windows = win("a", "/");
+        windows.extend(win("b", "/"));
+        windows[1].backend = "iterm2".into();
+        let snap = Snapshot {
+            version: model::SNAPSHOT_VERSION,
+            taken_at: chrono::Local::now(),
+            boot_time: 1,
+            backend: String::new(),
+            windows,
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(covers(&snap, &names(&["ghostty", "iterm2"])));
+        assert!(!covers(&snap, &names(&["ghostty"])), "--backend ghostty");
     }
 
     #[test]
