@@ -55,7 +55,8 @@ pub fn write(snap: &Snapshot) -> Result<PathBuf> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    // Named after the process: a manual save and the agent's can overlap.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
