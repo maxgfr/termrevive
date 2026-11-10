@@ -131,11 +131,7 @@ impl OneOrMany {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(d) => PathBuf::from(d),
-        None => dirs::home_dir()?.join(".config"),
-    };
-    Some(base.join("termrevive").join("config.toml"))
+    Some(crate::backend::conf::xdg_dir("termrevive")?.join("config.toml"))
 }
 
 impl Config {

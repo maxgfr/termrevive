@@ -98,11 +98,7 @@ pub fn write_key(files: &[PathBuf], key: &str, value: &str, syntax: Syntax) -> R
 
 /// `$XDG_CONFIG_HOME/<app>` or `~/.config/<app>`.
 pub fn xdg_dir(app: &str) -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(d) => PathBuf::from(d),
-        None => dirs::home_dir()?.join(".config"),
-    };
-    Some(base.join(app))
+    Some(crate::paths::env_or_home("XDG_CONFIG_HOME", ".config")?.join(app))
 }
 
 #[cfg(test)]

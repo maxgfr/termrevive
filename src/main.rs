@@ -4,6 +4,7 @@ mod harness;
 mod launchd;
 mod matcher;
 mod model;
+mod paths;
 mod procs;
 mod rules;
 mod store;

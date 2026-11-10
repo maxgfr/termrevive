@@ -51,6 +51,7 @@ struct KWindow {
 
 fn config_files() -> Vec<PathBuf> {
     let dir = std::env::var_os("KITTY_CONFIG_DIRECTORY")
+        .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .or_else(|| conf::xdg_dir("kitty"));
     dir.map(|d| vec![d.join("kitty.conf")]).unwrap_or_default()

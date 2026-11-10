@@ -111,19 +111,11 @@ pub fn display(name: &str) -> String {
 }
 
 /// `$VAR`, else `~/<default>`.
-pub fn home_dir_from(var: &str, default: &str) -> Option<PathBuf> {
-    match std::env::var_os(var) {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => Some(dirs::home_dir()?.join(default)),
-    }
-}
+pub use crate::paths::env_or_home as home_dir_from;
 
 /// `$XDG_DATA_HOME/<app>`, else `~/.local/share/<app>`.
 pub fn xdg_data(app: &str) -> Option<PathBuf> {
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d).join(app)),
-        _ => Some(dirs::home_dir()?.join(".local/share").join(app)),
-    }
+    Some(home_dir_from("XDG_DATA_HOME", ".local/share")?.join(app))
 }
 
 #[cfg(test)]

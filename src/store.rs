@@ -11,11 +11,9 @@ use std::path::{Path, PathBuf};
 const KEEP: usize = 30;
 
 pub fn state_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("termrevive")
+    crate::paths::env_or_home("XDG_STATE_HOME", ".local/state")
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("termrevive")
 }
 
 fn snapshots_dir() -> PathBuf {
