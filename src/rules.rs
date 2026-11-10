@@ -209,7 +209,7 @@ impl Config {
                 return l;
             }
         }
-        let cmd = render(&self.default.command, pane).filter(|c| !c.is_empty());
+        let cmd = render(&self.default.command, pane, true).filter(|c| !c.is_empty());
         Launch {
             input: cmd,
             run: self.default.run,
@@ -227,11 +227,11 @@ impl Config {
         {
             return None;
         }
-        let cmd = render(&rule.command, pane)?;
+        let cmd = render(&rule.command, pane, true)?;
         let cwd = rule
             .cwd
             .as_deref()
-            .and_then(|c| render(c, pane))
+            .and_then(|c| render(c, pane, false))
             .filter(|c| Path::new(c).is_dir())
             .unwrap_or_else(|| fallback_cwd.to_string());
         Some(Launch {
@@ -251,29 +251,34 @@ pub struct Launch {
     pub run: bool,
 }
 
-/// Fills `{var}` placeholders; `None` if one is unknown or unavailable.
-fn render(template: &str, pane: &Pane) -> Option<String> {
+/// Fills `{var}` placeholders; `None` if one is unknown or unavailable. With
+/// `quote` the result is a command line and every value is shell-quoted;
+/// without, it is a path and values are left as they are.
+fn render(template: &str, pane: &Pane, quote: bool) -> Option<String> {
     let program = pane.program.as_ref();
     let agent = program.and_then(|p| p.agent.as_ref());
+    let value = |s: &str| {
+        if quote { shell_quote(s) } else { s.to_string() }
+    };
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find('{') {
         out.push_str(&rest[..start]);
         let end = rest[start..].find('}')? + start;
-        let value = match &rest[start + 1..end] {
+        let filled = match &rest[start + 1..end] {
             "argv" => program?
                 .argv
                 .iter()
                 .map(|a| shell_quote(a))
                 .collect::<Vec<_>>()
                 .join(" "),
-            "cwd" => shell_quote(&pane.cwd),
-            "session_id" | "claude_session_id" => shell_quote(&agent?.session_id),
-            "session_cwd" | "claude_cwd" => agent?.cwd.clone(),
-            "session_name" | "claude_name" => shell_quote(agent?.name.as_deref()?),
+            "cwd" => value(&pane.cwd),
+            "session_id" | "claude_session_id" => value(&agent?.session_id),
+            "session_cwd" | "claude_cwd" => value(&agent?.cwd),
+            "session_name" | "claude_name" => value(agent?.name.as_deref()?),
             _ => return None,
         };
-        out.push_str(&value);
+        out.push_str(&filled);
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
@@ -361,6 +366,23 @@ mod tests {
         .unwrap();
         let l = legacy.launch(&pane("claude", &["claude"], session("claude", "abc", "/")));
         assert_eq!(l.input.as_deref(), Some("claude -r abc"));
+    }
+
+    #[test]
+    fn paths_are_quoted_in_commands_and_raw_in_cwd() {
+        let dir = std::env::temp_dir().join(format!("termrevive rules {}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let d = dir.display().to_string();
+        let cfg: Config = toml::from_str(
+            "[[rule]]\nmatch = \"claude\"\ncommand = \"cd {session_cwd} && claude -r {session_id}\"\ncwd = \"{cwd}/sub\"\n",
+        )
+        .unwrap();
+        let mut p = pane("claude", &["claude"], session("claude", "abc", &d));
+        p.cwd = d.clone();
+        let l = cfg.launch(&p);
+        assert_eq!(l.input, Some(format!("cd '{d}' && claude -r abc")));
+        assert_eq!(l.cwd, format!("{d}/sub"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
