@@ -16,6 +16,11 @@ pub const DEFAULT_CONFIG: &str = r#"# termrevive configuration. Rules are tried 
 #   {cwd}                the pane's working directory
 #   {session_id}  {session_cwd}  {session_name}   (agent sessions only)
 #   {claude_session_id}  {claude_cwd}  {claude_name}   (same, older names)
+# A literal brace is written {{ or }}: command = "awk '{{print $1}}'".
+# `termrevive doctor` points out a template that cannot be filled.
+#
+# A rule without `cwd` runs in the pane's directory, or for an agent session
+# in the session's own directory (its project or worktree).
 #
 # run = true types the command and presses Enter; run = false only types it.
 
@@ -144,6 +149,20 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// Templates that can never be filled: a rule using one is skipped.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let at = format!("[[rule]] #{}", i + 1);
+            out.extend(check(&rule.command).map(|e| format!("{at} command: {e}")));
+            if let Some(cwd) = &rule.cwd {
+                out.extend(check(cwd).map(|e| format!("{at} cwd: {e}")));
+            }
+        }
+        out.extend(check(&self.default.command).map(|e| format!("[default] command: {e}")));
+        out
+    }
+
     fn builtins(&self) -> Vec<Rule> {
         if self.builtin_rules {
             toml::from_str::<Builtins>(BUILTIN_RULES)
@@ -157,7 +176,7 @@ impl Config {
     /// How to bring `pane` back.
     pub fn launch(&self, pane: &Pane) -> Launch {
         let home = || {
-            dirs::home_dir()
+            crate::paths::home()
                 .map(|h| h.display().to_string())
                 .unwrap_or_default()
         };
@@ -184,9 +203,16 @@ impl Config {
                 .filter(|c| Path::new(c).is_dir())
                 .unwrap_or_else(|| base.cwd.clone())
         };
-        // Your rules first.
+        // Your rules first. One without a `cwd` that matches an agent session
+        // runs where the session belongs (its project or worktree), which is
+        // where the agent's resume command finds it.
+        let rule_cwd = if program.agent.is_some() {
+            session_cwd()
+        } else {
+            base.cwd.clone()
+        };
         for rule in &self.rules {
-            if let Some(l) = self.apply(rule, pane, &base.cwd) {
+            if let Some(l) = self.apply(rule, pane, &rule_cwd) {
                 return l;
             }
         }
@@ -201,7 +227,10 @@ impl Config {
             };
         }
         for rule in self.builtins() {
-            if let Some(l) = self.apply(&rule, pane, &base.cwd) {
+            if let Some(mut l) = self.apply(&rule, pane, &base.cwd) {
+                // A shell on the remote host comes back on its own; a command
+                // run there is only typed, like any unknown command.
+                l.run &= !remote_command(&program.argv);
                 return l;
             }
         }
@@ -247,6 +276,67 @@ pub struct Launch {
     pub run: bool,
 }
 
+/// The variables a template may use.
+const VARIABLES: &[&str] = &[
+    "argv",
+    "cwd",
+    "session_id",
+    "session_cwd",
+    "session_name",
+    "claude_session_id",
+    "claude_cwd",
+    "claude_name",
+];
+
+/// A piece of a template.
+#[derive(Debug, PartialEq)]
+enum Piece<'a> {
+    Text(&'a str),
+    Var(&'a str),
+}
+
+/// Splits a template into text and `{var}`s; `{{` and `}}` are a literal
+/// brace. Fails on a brace that opens or closes nothing.
+fn parse(template: &str) -> Result<Vec<Piece<'_>>, String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(at) = rest.find(['{', '}']) {
+        if at > 0 {
+            out.push(Piece::Text(&rest[..at]));
+        }
+        let brace = &rest[at..at + 1];
+        if rest[at + 1..].starts_with(brace) {
+            out.push(Piece::Text(brace));
+            rest = &rest[at + 2..];
+        } else if brace == "}" {
+            return Err(format!("a lone `}}` in `{template}` (write `}}}}`)"));
+        } else {
+            let end = rest[at..]
+                .find('}')
+                .ok_or_else(|| format!("an unclosed `{{` in `{template}` (write `{{{{`)"))?;
+            out.push(Piece::Var(&rest[at + 1..at + end]));
+            rest = &rest[at + end + 1..];
+        }
+    }
+    if !rest.is_empty() {
+        out.push(Piece::Text(rest));
+    }
+    Ok(out)
+}
+
+/// What is wrong with `template`, if anything.
+fn check(template: &str) -> Option<String> {
+    match parse(template) {
+        Err(e) => Some(e),
+        Ok(pieces) => pieces.iter().find_map(|p| match p {
+            Piece::Var(v) if !VARIABLES.contains(v) => Some(format!(
+                "unknown variable `{{{v}}}` in `{template}` (a literal brace is `{{{{` or `}}}}`)"
+            )),
+            _ => None,
+        }),
+    }
+}
+
 /// Fills `{var}` placeholders; `None` if one is unknown or unavailable. With
 /// `quote` the result is a command line and every value is shell-quoted;
 /// without, it is a path and values are left as they are.
@@ -257,28 +347,76 @@ fn render(template: &str, pane: &Pane, quote: bool) -> Option<String> {
         if quote { shell_quote(s) } else { s.to_string() }
     };
     let mut out = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        out.push_str(&rest[..start]);
-        let end = rest[start..].find('}')? + start;
-        let filled = match &rest[start + 1..end] {
-            "argv" => program?
-                .argv
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
-            "cwd" => value(&pane.cwd),
-            "session_id" | "claude_session_id" => value(&agent?.session_id),
-            "session_cwd" | "claude_cwd" => value(&agent?.cwd),
-            "session_name" | "claude_name" => value(agent?.name.as_deref()?),
-            _ => return None,
-        };
-        out.push_str(&filled);
-        rest = &rest[end + 1..];
+    for piece in parse(template).ok()? {
+        match piece {
+            Piece::Text(t) => out.push_str(t),
+            Piece::Var(v) => out.push_str(&match v {
+                "argv" => program?
+                    .argv
+                    .iter()
+                    .map(|a| shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "cwd" => value(&pane.cwd),
+                "session_id" | "claude_session_id" => value(&agent?.session_id),
+                "session_cwd" | "claude_cwd" => value(&agent?.cwd),
+                "session_name" | "claude_name" => value(agent?.name.as_deref()?),
+                _ => return None,
+            }),
+        }
     }
-    out.push_str(rest);
     Some(out)
+}
+
+/// Whether an `ssh` or `mosh` command line runs a command on the remote host
+/// (`ssh host 'rm -rf build'`) rather than opening a shell there.
+fn remote_command(argv: &[String]) -> bool {
+    let Some(name) = argv.first().map(|a| crate::procs::basename(a)) else {
+        return false;
+    };
+    // Options that take a value, as `-p 22` or `-p22`.
+    let (short, long): (&str, &[&str]) = match name {
+        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", &[]),
+        "mosh" => (
+            "p",
+            &[
+                "--client",
+                "--server",
+                "--ssh",
+                "--port",
+                "--predict",
+                "--bind-server",
+                "--family",
+                "--experimental-remote-ip",
+            ],
+        ),
+        _ => return false,
+    };
+    let mut args = argv[1..].iter();
+    let mut positional = 0;
+    while let Some(a) = args.next() {
+        if a == "--" {
+            positional += args.len();
+            break;
+        }
+        if a.starts_with("--") {
+            if long.contains(&a.as_str()) {
+                args.next();
+            }
+        } else if let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
+            // Flags can be grouped (`-vp 22`); the first that takes a value
+            // ends the group, its value being the rest or the next argument.
+            if let Some(i) = flags.find(|c| short.contains(c))
+                && i + 1 == flags.len()
+            {
+                args.next();
+            }
+        } else {
+            positional += 1;
+        }
+    }
+    // The destination, then the command.
+    positional > 1
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -440,7 +578,103 @@ mod tests {
         };
         let l = Config::default().launch(&p);
         assert_eq!(l.input, None);
-        assert_eq!(l.cwd, dirs::home_dir().unwrap().display().to_string());
+        assert_eq!(l.cwd, crate::paths::home().unwrap().display().to_string());
+    }
+
+    #[test]
+    fn literal_braces_and_unknown_variables() {
+        let p = pane("awk", &["awk"], None);
+        assert_eq!(
+            render("awk '{{print $1}}' {argv}", &p, true).as_deref(),
+            Some("awk '{print $1}' awk")
+        );
+        assert_eq!(render("awk '{print $1}'", &p, true), None);
+        assert_eq!(check("cd {session_cwd} && {argv} {{x}}"), None);
+        assert!(
+            check("awk '{print $1}'")
+                .unwrap()
+                .contains("unknown variable `{print $1}`")
+        );
+        assert!(check("{argv").unwrap().contains("unclosed"));
+        assert!(check("x }").unwrap().contains("lone"));
+
+        let cfg: Config = toml::from_str(
+            "[[rule]]\nmatch = \"x\"\ncommand = \"{argv}\"\n\
+             [[rule]]\nmatch = \"y\"\ncommand = \"{nope}\"\ncwd = \"{cwd\"\n\
+             [default]\ncommand = \"{argv} {sesion_id}\"\n",
+        )
+        .unwrap();
+        let problems = cfg.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].starts_with("[[rule]] #2 command: unknown variable `{nope}`"));
+        assert!(problems[1].starts_with("[[rule]] #2 cwd: an unclosed"));
+        assert!(problems[2].starts_with("[default] command: unknown variable `{sesion_id}`"));
+        assert!(Config::default().problems().is_empty());
+        let shipped: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(shipped.problems().is_empty());
+    }
+
+    #[test]
+    fn a_rule_on_an_agent_runs_in_the_session_directory() {
+        let dir = std::env::temp_dir().join(format!("termrevive worktree {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display().to_string();
+        let cfg: Config =
+            toml::from_str("[[rule]]\nmatch = \"claude\"\ncommand = \"claude -r {session_id}\"\n")
+                .unwrap();
+        // The pane's shell is in the main checkout, the session in a worktree.
+        let l = cfg.launch(&pane("claude", &["claude"], session("claude", "abc", &d)));
+        assert_eq!(
+            (l.input.as_deref(), l.cwd.as_str()),
+            (Some("claude -r abc"), d.as_str())
+        );
+        // Its own `cwd` still wins; a program that is no agent stays put.
+        let cfg: Config = toml::from_str(
+            "[[rule]]\nmatch = [\"claude\", \"make\"]\ncommand = \"{argv}\"\ncwd = \"/\"\n",
+        )
+        .unwrap();
+        let l = cfg.launch(&pane("claude", &["claude"], session("claude", "abc", &d)));
+        assert_eq!(l.cwd, "/");
+        let l = Config::default().launch(&Pane {
+            cwd: "/".into(),
+            ..pane("make", &["make"], None)
+        });
+        assert_eq!(l.cwd, "/");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_with_a_remote_command_is_only_typed() {
+        let run = |argv: &str| {
+            let argv: Vec<&str> = argv.split(' ').collect();
+            Config::default().launch(&pane(argv[0], &argv, None)).run
+        };
+        for shell in [
+            "ssh host",
+            "ssh -p 2222 user@host",
+            "ssh -p2222 -L 8080:localhost:80 host",
+            "ssh -vA -i key host",
+            "ssh -o ServerAliveInterval=30 host",
+            "mosh host",
+            "mosh --ssh=ssh -p 22 host",
+            "mosh -p 60001 host",
+        ] {
+            assert!(run(shell), "{shell}");
+        }
+        for command in [
+            "ssh host rm -rf build",
+            "ssh -t host htop",
+            "ssh -p 22 host -- ls",
+            "mosh host -- tmux attach",
+            "mosh --ssh ssh host top",
+        ] {
+            assert!(!run(command), "{command}");
+        }
+        // A rule of yours is taken as it is.
+        let cfg: Config =
+            toml::from_str("[[rule]]\nmatch = \"ssh\"\ncommand = \"{argv}\"\nrun = true\n")
+                .unwrap();
+        assert!(cfg.launch(&pane("ssh", &["ssh", "host", "ls"], None)).run);
     }
 
     #[test]
