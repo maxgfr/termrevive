@@ -27,16 +27,6 @@ fn split(line: &str, syntax: Syntax) -> Option<(&str, &str)> {
     Some((k.trim(), v.trim()))
 }
 
-impl Syntax {
-    /// The directive that includes another file.
-    fn include(self) -> &'static str {
-        match self {
-            Syntax::Equals => "config-file",
-            Syntax::Space => "include",
-        }
-    }
-}
-
 /// `"x"` → `x`.
 fn unquote(v: &str) -> &str {
     v.strip_prefix('"')
@@ -126,6 +116,20 @@ fn visit(
     let Ok(text) = fs::read_to_string(file) else {
         return later;
     };
+    read_lines(&text, file, key, syntax, seen, out, &mut later);
+    later
+}
+
+/// The lines of `text`, read as if they were in `file`.
+fn read_lines(
+    text: &str,
+    file: &Path,
+    key: &str,
+    syntax: Syntax,
+    seen: &mut HashSet<PathBuf>,
+    out: &mut Vec<(PathBuf, String)>,
+    later: &mut Vec<PathBuf>,
+) {
     for l in text.lines() {
         let Some((k, v)) = split(l, syntax) else {
             continue;
@@ -136,19 +140,104 @@ fn visit(
                 Syntax::Space => v,
             };
             out.push((file.to_path_buf(), v.to_string()));
-        } else if k == syntax.include()
-            && let Some(inc) = included(v, file, syntax)
-        {
-            match syntax {
-                Syntax::Space => {
-                    let more = visit(&inc, key, syntax, seen, out);
-                    later.extend(more);
+            continue;
+        }
+        match (syntax, k) {
+            (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
+            (Syntax::Space, "include") => {
+                for inc in included(v, file, syntax) {
+                    later.extend(visit(&inc, key, syntax, seen, out));
                 }
-                Syntax::Equals => later.push(inc),
             }
+            // Every file matching a pattern, in order of name.
+            (Syntax::Space, "globinclude") => {
+                for inc in included(v, file, syntax)
+                    .map(|p| glob(&p))
+                    .unwrap_or_default()
+                {
+                    later.extend(visit(&inc, key, syntax, seen, out));
+                }
+            }
+            // The contents of every variable whose name matches, in order of
+            // name, read as lines of this file.
+            (Syntax::Space, "envinclude") => {
+                let mut vars: Vec<(String, String)> = std::env::vars()
+                    .filter(|(name, _)| wildcard(v, name))
+                    .collect();
+                vars.sort();
+                for (_, text) in vars {
+                    read_lines(&text, file, key, syntax, seen, out, later);
+                }
+            }
+            // `geninclude` runs a program to produce its lines: doctor does
+            // not run programs from a config file.
+            _ => {}
         }
     }
-    later
+}
+
+/// Whether `name` matches `pattern`: `*` is any run of characters, `?` one.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some(('*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
+            Some(('?', rest)) => !n.is_empty() && go(rest, &n[1..]),
+            Some((c, rest)) => n.first() == Some(c) && go(rest, &n[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    go(&p, &n)
+}
+
+/// The files matching `pattern`, sorted: `*` and `?` within a path segment,
+/// `**` for any number of directories.
+fn glob(pattern: &Path) -> Vec<PathBuf> {
+    let segments: Vec<String> = pattern
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let literal = segments
+        .iter()
+        .take_while(|s| !s.contains(['*', '?']))
+        .count();
+    let root: PathBuf = segments[..literal].iter().collect();
+    let mut out = Vec::new();
+    walk(&root, &segments[literal..], &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn walk(dir: &Path, pattern: &[String], out: &mut Vec<PathBuf>) {
+    let Some((first, rest)) = pattern.split_first() else {
+        if dir.is_file() {
+            out.push(dir.to_path_buf());
+        }
+        return;
+    };
+    if first == "**" {
+        // No directory at all, or one more and `**` again.
+        walk(dir, rest, out);
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = e.path();
+        if first == "**" {
+            if path.is_dir() {
+                walk(&path, pattern, out);
+            }
+        } else if wildcard(first, &name) {
+            walk(&path, rest, out);
+        }
+    }
 }
 
 fn line(key: &str, value: &str, syntax: Syntax) -> String {
@@ -304,6 +393,38 @@ mod tests {
             read_key(&files, "listen_on", Syntax::Space).as_deref(),
             Some("unix:/x")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn follows_kittys_glob_and_environment_includes() {
+        let dir = std::env::temp_dir().join(format!("termrevive-glob-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("kitty.d/deep/er")).unwrap();
+        let write = |name: &str, text: &str| fs::write(dir.join(name), text).unwrap();
+        write(
+            "kitty.conf",
+            "listen_on unix:/0\nglobinclude kitty.d/**/*.conf\n",
+        );
+        write("kitty.d/a.conf", "listen_on unix:/a\n");
+        write("kitty.d/deep/er/b.conf", "listen_on unix:/b\n");
+        write("kitty.d/deep/c.txt", "listen_on unix:/c\n");
+        let files = [dir.join("kitty.conf")];
+        let all: Vec<String> = assignments(&files, "listen_on", Syntax::Space)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(all, ["unix:/0", "unix:/a", "unix:/b"]);
+        // An environment include: HOME is set in every test run.
+        write("env.conf", "allow_remote_control no\nenvinclude HOM?\n");
+        let files = [dir.join("env.conf")];
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            read_key(&files, &home, Syntax::Space).as_deref(),
+            Some(""),
+            "the variable's contents are read as a line"
+        );
+        assert!(wildcard("KITTY_CONF_*", "KITTY_CONF_X") && !wildcard("KITTY_*", "KIT"));
         let _ = fs::remove_dir_all(&dir);
     }
 
