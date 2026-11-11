@@ -6,7 +6,7 @@
 //! is not: it runs a program.
 
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -94,28 +94,23 @@ fn included(value: &str, from: &Path, syntax: Syntax) -> Option<PathBuf> {
 fn assignments(files: &[PathBuf], key: &str, syntax: Syntax) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let mut trail = Trail::default();
-    let mut queue: VecDeque<Later> = files.iter().map(|f| (f.clone(), Vec::new())).collect();
-    while let Some((file, ancestors)) = queue.pop_front() {
-        trail.ancestors = ancestors;
+    let mut queue: VecDeque<PathBuf> = files.iter().cloned().collect();
+    while let Some(file) = queue.pop_front() {
         let later = visit(&file, key, syntax, &mut trail, &mut out);
         queue.extend(later);
     }
     out
 }
 
-/// Where a read is in the include tree.
+/// The files read so far. Each is read once: Ghostty (1.4) and kitty (0.39)
+/// both skip a file included again, cycle or not.
 #[derive(Default)]
 struct Trail {
-    /// The files that include the one being read: including one of them
-    /// again is a cycle, cut there. A file included twice elsewhere is read
-    /// twice, as the terminals do.
-    ancestors: Vec<PathBuf>,
-    /// Files read so far, capped in case of a runaway tree.
-    reads: usize,
+    read: HashSet<PathBuf>,
 }
 
-/// A file read later, with the files that include it.
-type Later = (PathBuf, Vec<PathBuf>);
+/// A file read later (Ghostty's `config-file`).
+type Later = PathBuf;
 
 /// Reads `file` into `out`; returns the files it includes that are read later.
 fn visit(
@@ -127,16 +122,13 @@ fn visit(
 ) -> Vec<Later> {
     let id = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let mut later = Vec::new();
-    if trail.reads >= 256 || trail.ancestors.contains(&id) {
+    if trail.read.len() >= 256 || !trail.read.insert(id) {
         return later;
     }
     let Ok(text) = fs::read_to_string(file) else {
         return later;
     };
-    trail.reads += 1;
-    trail.ancestors.push(id);
     read_lines(&text, file, key, syntax, trail, out, &mut later);
-    trail.ancestors.pop();
     later
 }
 
@@ -163,9 +155,7 @@ fn read_lines(
             continue;
         }
         match (syntax, k) {
-            (Syntax::Equals, "config-file") => {
-                later.extend(included(v, file, syntax).map(|inc| (inc, trail.ancestors.clone())))
-            }
+            (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
             (Syntax::Space, "include") => {
                 if let Some(inc) = included(v, file, syntax) {
                     later.extend(visit(&inc, key, syntax, trail, out));
@@ -248,10 +238,6 @@ fn walk(dir: &Path, pattern: &[String], out: &mut Vec<PathBuf>) {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        // Hidden files only match a pattern that names them, as in a shell.
-        if name.starts_with('.') && !first.starts_with('.') {
-            continue;
-        }
         let path = e.path();
         if first == "**" {
             if path.is_dir() {
@@ -438,7 +424,7 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(all, ["unix:/0", "unix:/a", "unix:/b"]);
-        // Included twice (not a cycle): read twice, the second one winning.
+        // Included again: skipped, as kitty and Ghostty do.
         write(
             "twice.conf",
             "include kitty.d/a.conf\nlisten_on unix:/t\ninclude kitty.d/a.conf\n",
@@ -446,21 +432,17 @@ mod tests {
         let files = [dir.join("twice.conf")];
         assert_eq!(
             read_key(&files, "listen_on", Syntax::Space).as_deref(),
-            Some("unix:/a")
+            Some("unix:/t")
         );
-        // A hidden file only matches a pattern that starts with a dot.
+        // kitty's glob (pathlib) matches hidden files too, in order of name.
         write("kitty.d/.hidden.conf", "listen_on unix:/h\n");
         write("hidden.conf", "globinclude kitty.d/*.conf\n");
         let files = [dir.join("hidden.conf")];
-        assert_eq!(
-            read_key(&files, "listen_on", Syntax::Space).as_deref(),
-            Some("unix:/a")
-        );
-        write("hidden.conf", "globinclude kitty.d/.*.conf\n");
-        assert_eq!(
-            read_key(&files, "listen_on", Syntax::Space).as_deref(),
-            Some("unix:/h")
-        );
+        let all: Vec<String> = assignments(&files, "listen_on", Syntax::Space)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(all, ["unix:/h", "unix:/a"]);
         // An environment include: HOME is set in every test run.
         write("env.conf", "allow_remote_control no\nenvinclude HOM?\n");
         let files = [dir.join("env.conf")];
@@ -471,6 +453,27 @@ mod tests {
             "the variable's contents are read as a line"
         );
         assert!(wildcard("KITTY_CONF_*", "KITTY_CONF_X") && !wildcard("KITTY_*", "KIT"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghostty_reads_a_repeated_config_file_once() {
+        // Checked against Ghostty 1.4.0's +show-config: `always`.
+        let dir = std::env::temp_dir().join(format!("termrevive-repeat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config"),
+            "config-file = a\nconfig-file = b\nconfig-file = a\n",
+        )
+        .unwrap();
+        fs::write(dir.join("a"), "window-save-state = never\n").unwrap();
+        fs::write(dir.join("b"), "window-save-state = always\n").unwrap();
+        let files = [dir.join("config")];
+        assert_eq!(
+            read_key(&files, KEY, Syntax::Equals).as_deref(),
+            Some("always")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
