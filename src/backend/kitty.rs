@@ -9,14 +9,32 @@ use super::conf::{self, Syntax};
 use super::{Backend, Caps, RawLayout, RawTab, RawTerminal, RawWindow, Setting, WindowPlan};
 use crate::exec;
 use crate::procs::{self, Proc};
-use crate::rules::Launch;
+use crate::rules::{Launch, shell_quote};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub struct Kitty;
+/// kitty, and during a restore the instance it drives.
+#[derive(Default)]
+pub struct Kitty {
+    conn: RefCell<Option<Conn>>,
+}
+
+/// A kitty instance's remote control: the `kitten` to run and its socket.
+#[derive(Clone)]
+struct Conn {
+    kitten: PathBuf,
+    socket: String,
+}
+
+impl Conn {
+    fn remote(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        remote(&self.kitten, &self.socket, args, stdin)
+    }
+}
 
 const BUNDLE: &str = "net.kovidgoyal.kitty";
 const EXE_SUFFIX: &str = "kitty.app/Contents/MacOS/kitty";
@@ -87,7 +105,7 @@ fn remote(kitten: &Path, socket: &str, args: &[&str], stdin: Option<&str>) -> Re
 fn connect_all(procs: &[Proc]) -> Vec<(String, String)> {
     let kitten = kitten(procs);
     let mut found = Vec::new();
-    for pid in Kitty.host_pids(procs) {
+    for pid in procs::pids_by_exe(procs, EXE_SUFFIX) {
         let Ok(out) = exec::output(
             Command::new("/usr/sbin/lsof").args(["-a", "-p", &pid.to_string(), "-U", "-Fn"]),
             None,
@@ -219,6 +237,24 @@ fn steps(window: &WindowPlan) -> Vec<Step> {
     out
 }
 
+impl Kitty {
+    /// The instance a restore drives: found once (a process table, an `lsof`
+    /// and a `kitten @ ls`), then reused for every window.
+    fn conn(&self) -> Result<Conn> {
+        if let Some(c) = self.conn.borrow().clone() {
+            return Ok(c);
+        }
+        let procs = procs::process_table()?;
+        let (socket, _) = connect(&procs)?;
+        let c = Conn {
+            kitten: kitten(&procs),
+            socket,
+        };
+        *self.conn.borrow_mut() = Some(c.clone());
+        Ok(c)
+    }
+}
+
 impl Backend for Kitty {
     fn name(&self) -> &'static str {
         "kitty"
@@ -259,8 +295,9 @@ impl Backend for Kitty {
             osa::launch(BUNDLE)?;
         }
         let deadline = Instant::now() + Duration::from_secs(60);
+        self.conn.replace(None);
         loop {
-            match connect(&procs::process_table()?) {
+            match self.conn() {
                 Ok(_) => return Ok(()),
                 Err(e) if Instant::now() >= deadline => return Err(e),
                 Err(_) => std::thread::sleep(Duration::from_millis(500)),
@@ -269,8 +306,7 @@ impl Backend for Kitty {
     }
 
     fn blank_windows(&self) -> Result<Vec<String>> {
-        let procs = procs::process_table()?;
-        let (_, ls) = connect(&procs)?;
+        let ls = self.conn()?.remote(&["ls"], None)?;
         let os_windows: Vec<OsWindow> = serde_json::from_str(&ls)?;
         Ok(os_windows
             .iter()
@@ -283,16 +319,9 @@ impl Backend for Kitty {
         if ids.is_empty() {
             return Ok(());
         }
-        let procs = procs::process_table()?;
-        let (socket, _) = connect(&procs)?;
-        let kitten = kitten(&procs);
+        let conn = self.conn()?;
         for id in ids {
-            let _ = remote(
-                &kitten,
-                &socket,
-                &["close-window", &format!("--match=id:{id}")],
-                None,
-            );
+            let _ = conn.remote(&["close-window", &format!("--match=id:{id}")], None);
         }
         Ok(())
     }
@@ -307,20 +336,19 @@ impl Backend for Kitty {
                     .as_ref()
                     .map(|t| match t.strip_suffix('\r') {
                         Some(cmd) => {
-                            format!("printf '%s\\r' {} | ", crate::rules::shell_quote(cmd))
+                            format!("printf '%s\\r' {} | ", shell_quote(cmd))
                         }
-                        None => format!("printf %s {} | ", crate::rules::shell_quote(t)),
+                        None => format!("printf %s {} | ", shell_quote(t)),
                     })
                     .unwrap_or_default();
-                format!("{input}kitten @ {}    # ${i}\n", s.args.join(" "))
+                let args: Vec<String> = s.args.iter().map(|a| shell_quote(a)).collect();
+                format!("{input}kitten @ {}    # ${i}\n", args.join(" "))
             })
             .collect()
     }
 
     fn restore_window(&self, window: &WindowPlan, delay_ms: u64) -> Result<()> {
-        let procs = procs::process_table()?;
-        let (socket, _) = connect(&procs)?;
-        let kitten = kitten(&procs);
+        let conn = self.conn()?;
         let mut ids: Vec<String> = Vec::new();
         for step in steps(window) {
             if step.args[0] == "launch" && !ids.is_empty() {
@@ -338,7 +366,7 @@ impl Backend for Kitty {
                 })
                 .collect();
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let out = remote(&kitten, &socket, &refs, step.stdin.as_deref())?;
+            let out = conn.remote(&refs, step.stdin.as_deref())?;
             ids.push(out.lines().last().unwrap_or("").trim().to_string());
         }
         Ok(())
@@ -363,7 +391,9 @@ impl Backend for Kitty {
                 name: LISTEN,
                 ok: listen.as_deref().is_some_and(|l| l.starts_with("unix:")),
                 current: listen,
-                wanted: "unix:/tmp/kitty",
+                // kitty expands the variable: a socket in the user's own
+                // temporary directory, not in the shared /tmp.
+                wanted: "unix:${TMPDIR}/kitty",
                 why: "the remote control needs a unix socket (restart kitty after the fix)",
             },
         ]
@@ -442,5 +472,28 @@ mod tests {
         );
         assert_eq!(s[1].stdin.as_deref(), Some("claude --resume x\r"));
         assert_eq!(s[4].stdin.as_deref(), Some("make"));
+    }
+
+    #[test]
+    fn the_dry_run_is_quoted_for_a_shell() {
+        let plan = WindowPlan {
+            tabs: vec![TabPlan {
+                selected: true,
+                panes: vec![Launch {
+                    cwd: "/a b".into(),
+                    input: Some("it's".into()),
+                    run: true,
+                }],
+            }],
+        };
+        let s = Kitty::default().restore_script(&plan, 0);
+        assert!(
+            s.starts_with("kitten @ launch --type=os-window '--cwd=/a b'    # $0\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains(r"printf '%s\r' 'it'\''s' | kitten @ send-text"),
+            "{s}"
+        );
     }
 }

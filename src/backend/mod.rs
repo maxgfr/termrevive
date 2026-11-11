@@ -121,7 +121,7 @@ pub fn registry() -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(ghostty::Ghostty),
         Box::new(iterm2::Iterm2),
-        Box::new(kitty::Kitty),
+        Box::new(kitty::Kitty::default()),
         Box::new(terminal::Terminal),
     ]
 }
