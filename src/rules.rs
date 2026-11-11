@@ -377,12 +377,15 @@ fn remote_command(argv: &[String]) -> bool {
     let Some(name) = argv.first().map(|a| crate::procs::basename(a)) else {
         return false;
     };
-    let command_valued = ["--ssh", "--server", "--client"];
+    // mosh's option parser also takes an unambiguous abbreviation (`--ss`).
+    let command_valued = ["ssh", "server", "client"];
     if name == "mosh"
         && argv[1..].iter().any(|a| {
-            command_valued
-                .iter()
-                .any(|o| a == o || a.starts_with(&format!("{o}=")))
+            let opt = a
+                .strip_prefix("--")
+                .map(|o| o.split('=').next().unwrap_or(o))
+                .unwrap_or("");
+            !opt.is_empty() && command_valued.iter().any(|o| o.starts_with(opt))
         })
     {
         return true;
@@ -681,6 +684,8 @@ mod tests {
             "mosh --ssh ssh host top",
             "mosh --ssh=ssh -p 22 host",
             "mosh --server='mosh-server new' host",
+            "mosh --ss=ssh -p 22 host",
+            "mosh --cl mosh-client host",
         ] {
             assert!(!run(command), "{command}");
         }
