@@ -370,47 +370,17 @@ fn render(template: &str, pane: &Pane, quote: bool) -> Option<String> {
 
 /// Whether an `ssh` or `mosh` command line runs a command on the remote host
 /// (`ssh host 'rm -rf build'`) rather than opening a shell there.
-/// For `mosh`, also one with an option whose value is a command line
-/// (`--ssh="ssh -p 2222"`): a live session only tells its arguments joined
-/// with spaces, so such a value may have come back split, with another meaning.
 fn remote_command(argv: &[String]) -> bool {
-    let Some(name) = argv.first().map(|a| crate::procs::basename(a)) else {
-        return false;
-    };
-    // mosh parses its options with Perl's Getopt::Long defaults: `--ssh`,
-    // `-ssh` or `+ssh`, in any case, abbreviated while unambiguous (`--ss`).
-    let command_valued = ["ssh", "server", "client"];
-    if name == "mosh"
-        && argv[1..].iter().take_while(|a| *a != "--").any(|a| {
-            let opt = a
-                .strip_prefix("--")
-                .or_else(|| a.strip_prefix('-'))
-                .or_else(|| a.strip_prefix('+'))
-                .map(|o| o.split('=').next().unwrap_or(o).to_ascii_lowercase())
-                .unwrap_or_default();
-            !opt.is_empty() && command_valued.iter().any(|o| o.starts_with(&opt))
-        })
-    {
-        return true;
+    match argv.first().map(|a| crate::procs::basename(a)) {
+        Some("ssh") => ssh_remote_command(argv),
+        Some("mosh") => mosh_remote_command(argv),
+        _ => false,
     }
+}
+
+fn ssh_remote_command(argv: &[String]) -> bool {
     // Options that take a value, as `-p 22` or `-p22`.
-    let (short, long): (&str, &[&str]) = match name {
-        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", &[]),
-        "mosh" => (
-            "p",
-            &[
-                "--client",
-                "--server",
-                "--ssh",
-                "--port",
-                "--predict",
-                "--bind-server",
-                "--family",
-                "--experimental-remote-ip",
-            ],
-        ),
-        _ => return false,
-    };
+    const VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
     let mut args = argv[1..].iter();
     let mut positional = 0;
     while let Some(a) = args.next() {
@@ -418,20 +388,92 @@ fn remote_command(argv: &[String]) -> bool {
             positional += args.len();
             break;
         }
-        if a.starts_with("--") {
-            if long.contains(&a.as_str()) {
-                args.next();
-            }
-        } else if let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
+        if let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
             // Flags can be grouped (`-vp 22`); the first that takes a value
             // ends the group, its value being the rest or the next argument.
-            if let Some(i) = flags.find(|c| short.contains(c))
+            if let Some(i) = flags.find(|c| VALUED.contains(c))
                 && i + 1 == flags.len()
             {
                 args.next();
             }
         } else {
             positional += 1;
+        }
+    }
+    // The destination, then the command.
+    positional > 1
+}
+
+/// mosh's options (`mosh.pl`, parsed by Getopt::Long with its defaults):
+/// those that take a value, then the others (`!` ones also as `no-…`).
+const MOSH_VALUED: &[&str] = &[
+    "client",
+    "server",
+    "predict",
+    "port",
+    "p",
+    "family",
+    "ssh",
+    "bind-server",
+    "experimental-remote-ip",
+];
+const MOSH_FLAGS: &[&str] = &[
+    "a",
+    "n",
+    "4",
+    "6",
+    "ssh-pty",
+    "no-ssh-pty",
+    "init",
+    "no-init",
+    "local",
+    "help",
+    "version",
+    "fake-proxy",
+    "no-fake-proxy",
+    "predict-overwrite",
+    "no-predict-overwrite",
+];
+
+/// For `mosh`, also one with an option whose value is a command line
+/// (`--ssh="ssh -p 2222"`): a live session only tells its arguments joined
+/// with spaces, so such a value may have come back split, with another
+/// meaning. Options are read as Getopt::Long does: `--ssh`, `-ssh` or `+ssh`,
+/// in any case, abbreviated while unambiguous (`--cl`).
+fn mosh_remote_command(argv: &[String]) -> bool {
+    let mut args = argv[1..].iter();
+    let mut positional = 0;
+    while let Some(a) = args.next() {
+        if a == "--" {
+            positional += args.len();
+            break;
+        }
+        let Some(opt) = a
+            .strip_prefix("--")
+            .or_else(|| a.strip_prefix(['-', '+']))
+            .filter(|o| !o.is_empty())
+        else {
+            positional += 1;
+            continue;
+        };
+        let (name, inline) = match opt.split_once('=') {
+            Some((name, _)) => (name.to_ascii_lowercase(), true),
+            None => (opt.to_ascii_lowercase(), false),
+        };
+        let all = MOSH_VALUED.iter().chain(MOSH_FLAGS);
+        let matched: Vec<&str> = match all.clone().find(|o| **o == name) {
+            Some(exact) => vec![exact],
+            None => all.filter(|o| o.starts_with(&name)).copied().collect(),
+        };
+        // Even when ambiguous (mosh then refuses it): only typed.
+        if matched
+            .iter()
+            .any(|o| ["ssh", "server", "client"].contains(o))
+        {
+            return true;
+        }
+        if !inline && !matched.is_empty() && matched.iter().all(|o| MOSH_VALUED.contains(o)) {
+            args.next();
         }
     }
     // The destination, then the command.
@@ -676,6 +718,11 @@ mod tests {
             "ssh -o ServerAliveInterval=30 host",
             "mosh host",
             "mosh -p 60001 host",
+            "mosh -port 60001 host",
+            "mosh --PORT 60001 host",
+            "mosh +p 60001 host",
+            "mosh --predict never host",
+            "mosh --no-ssh-pty -4 host",
         ] {
             assert!(run(shell), "{shell}");
         }
@@ -687,8 +734,9 @@ mod tests {
             "mosh --ssh ssh host top",
             "mosh --ssh=ssh -p 22 host",
             "mosh --server='mosh-server new' host",
-            "mosh --ss=ssh -p 22 host",
+            "mosh --se=mosh-server host",
             "mosh --cl mosh-client host",
+            "mosh -ssh-p host cmd",
             "mosh -ssh=ssh -p 22 host",
             "mosh --SSH=ssh -p 22 host",
             "mosh +ssh=ssh -p 22 host",
