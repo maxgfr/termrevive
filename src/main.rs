@@ -274,6 +274,12 @@ fn agent(
         };
         if let Err(e) = restore(&args, store) {
             log!("restore failed: {e:#}");
+            // Also when it failed before touching a terminal (a config that
+            // does not parse, an unreadable snapshot): auto-save must not wait
+            // for it all boot, and a retry by hand finds the snapshot.
+            if let Err(e) = store.mark_login_restore_failed(&procs::boot()) {
+                log!("could not record the failed restore: {e:#}");
+            }
         }
     }
     let Some(every) = save_every else {
