@@ -69,8 +69,12 @@ fn expand_vars(s: &str) -> String {
 /// The file an include directive in `from` names, if any.
 fn included(value: &str, from: &Path, syntax: Syntax) -> Option<PathBuf> {
     let value = match syntax {
-        // `?file`: no error if it is missing.
-        Syntax::Equals => unquote(value.strip_prefix('?').unwrap_or(value)).to_string(),
+        // `?file`: no error if it is missing. The `?` may be inside the
+        // quotes too (`"?file"`), as Ghostty 1.4.0 reads it.
+        Syntax::Equals => {
+            let v = unquote(value);
+            unquote(v.strip_prefix('?').unwrap_or(v)).to_string()
+        }
         Syntax::Space => expand_vars(value),
     };
     if value.is_empty() {
@@ -527,6 +531,28 @@ mod tests {
             read_key(&files, KEY, Syntax::Equals).as_deref(),
             Some("always")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_optional_mark_may_be_inside_the_quotes() {
+        let dir = std::env::temp_dir().join(format!("termrevive-optional-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a"), "window-save-state = always\n").unwrap();
+        let files = [dir.join("config")];
+        for line in [
+            "config-file = \"?a\"",
+            "config-file = ?\"a\"",
+            "config-file = ?a",
+        ] {
+            fs::write(&files[0], format!("{line}\nwindow-save-state = never\n")).unwrap();
+            assert_eq!(
+                read_key(&files, KEY, Syntax::Equals).as_deref(),
+                Some("always"),
+                "{line}"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
