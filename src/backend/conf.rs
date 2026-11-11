@@ -94,40 +94,71 @@ fn included(value: &str, from: &Path, syntax: Syntax) -> Option<PathBuf> {
 fn assignments(files: &[PathBuf], key: &str, syntax: Syntax) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let mut trail = Trail::default();
-    let mut queue: VecDeque<PathBuf> = files.iter().cloned().collect();
+    // Every file the terminal loads first, then (Ghostty) what they include.
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    for file in files {
+        queue.extend(visit(file, false, key, syntax, &mut trail, &mut out));
+    }
     while let Some(file) = queue.pop_front() {
-        let later = visit(&file, key, syntax, &mut trail, &mut out);
+        let later = visit(&file, true, key, syntax, &mut trail, &mut out);
         queue.extend(later);
     }
     out
 }
 
-/// The files read so far. Each is read once: Ghostty (1.4) and kitty (0.39)
-/// both skip a file included again, cycle or not.
+/// The files read so far. An included file is read once: Ghostty (1.4) and
+/// kitty (0.39) both skip a file included again, cycle or not. A file they
+/// load themselves is not among them: one that an include names is read once
+/// more.
 #[derive(Default)]
 struct Trail {
-    read: HashSet<PathBuf>,
+    included: HashSet<PathBuf>,
+    /// Files read, capped in case of a runaway tree.
+    reads: usize,
+}
+
+/// How each terminal tells two includes apart: Ghostty by the file itself
+/// (links resolved), kitty by its path once `.` and `..` are folded.
+fn identity(file: &Path, syntax: Syntax) -> PathBuf {
+    match syntax {
+        Syntax::Equals => file.canonicalize().unwrap_or_else(|_| file.to_path_buf()),
+        Syntax::Space => {
+            let mut out = PathBuf::new();
+            for c in file.components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    c => out.push(c),
+                }
+            }
+            out
+        }
+    }
 }
 
 /// A file read later (Ghostty's `config-file`).
 type Later = PathBuf;
 
-/// Reads `file` into `out`; returns the files it includes that are read later.
+/// Reads `file` (`included` by another, or loaded by the terminal itself)
+/// into `out`; returns the files it includes that are read later.
 fn visit(
     file: &Path,
+    included: bool,
     key: &str,
     syntax: Syntax,
     trail: &mut Trail,
     out: &mut Vec<(PathBuf, String)>,
 ) -> Vec<Later> {
-    let id = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let mut later = Vec::new();
-    if trail.read.len() >= 256 || !trail.read.insert(id) {
+    if trail.reads >= 256 || (included && !trail.included.insert(identity(file, syntax))) {
         return later;
     }
     let Ok(text) = fs::read_to_string(file) else {
         return later;
     };
+    trail.reads += 1;
     read_lines(&text, file, key, syntax, trail, out, &mut later);
     later
 }
@@ -158,7 +189,7 @@ fn read_lines(
             (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
             (Syntax::Space, "include") => {
                 if let Some(inc) = included(v, file, syntax) {
-                    later.extend(visit(&inc, key, syntax, trail, out));
+                    later.extend(visit(&inc, true, key, syntax, trail, out));
                 }
             }
             // Every file matching a pattern, in order of name.
@@ -167,7 +198,7 @@ fn read_lines(
                     .map(|p| glob(&p))
                     .unwrap_or_default()
                 {
-                    later.extend(visit(&inc, key, syntax, trail, out));
+                    later.extend(visit(&inc, true, key, syntax, trail, out));
                 }
             }
             // The contents of every variable whose name matches, in order of
@@ -359,6 +390,8 @@ mod tests {
 
         // Ghostty: an included file is read after the one including it, so
         // it wins over what follows the directive; `?` and quotes allowed.
+        // The main file named again from it is read once more (checked with
+        // Ghostty 1.4.0: `always`); its own includes are not.
         write(
             "config",
             "config-file = ?\"sub/theme\"\nconfig-file = ?missing\nwindow-save-state = always\n",
@@ -368,6 +401,11 @@ mod tests {
             "window-save-state = \"never\"\nconfig-file = ../config\n",
         );
         let files = [dir.join("config")];
+        assert_eq!(
+            read_key(&files, KEY, Syntax::Equals).as_deref(),
+            Some("always")
+        );
+        write("sub/theme", "window-save-state = \"never\"\n");
         assert_eq!(
             read_key(&files, KEY, Syntax::Equals).as_deref(),
             Some("never")
@@ -453,6 +491,42 @@ mod tests {
             "the variable's contents are read as a line"
         );
         assert!(wildcard("KITTY_CONF_*", "KITTY_CONF_X") && !wildcard("KITTY_*", "KIT"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_main_file_named_by_an_include_is_read_once_more() {
+        // Checked against Ghostty 1.4.0's +show-config: `always`.
+        let dir = std::env::temp_dir().join(format!("termrevive-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config"),
+            "window-save-state = always\nconfig-file = a\nconfig-file = config\n",
+        )
+        .unwrap();
+        fs::write(dir.join("a"), "window-save-state = never\n").unwrap();
+        let files = [dir.join("config")];
+        assert_eq!(
+            read_key(&files, KEY, Syntax::Equals).as_deref(),
+            Some("always")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghosttys_includes_load_after_every_default_file() {
+        let dir = std::env::temp_dir().join(format!("termrevive-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("first"), "config-file = inc\n").unwrap();
+        fs::write(dir.join("inc"), "window-save-state = never\n").unwrap();
+        fs::write(dir.join("second"), "window-save-state = always\n").unwrap();
+        let files = [dir.join("first"), dir.join("second")];
+        assert_eq!(
+            read_key(&files, KEY, Syntax::Equals).as_deref(),
+            Some("never")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
