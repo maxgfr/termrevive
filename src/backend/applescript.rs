@@ -42,11 +42,11 @@ pub fn run_for(script: &str, timeout: Duration) -> Result<String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-1743") {
-            bail!(
+            return Err(anyhow::Error::new(Refused).context(format!(
                 "macOS refused to let termrevive control this app. Allow it in System Settings → \
                  Privacy & Security → Automation, then retry.\n{}",
                 err.trim()
-            );
+            )));
         }
         bail!("osascript failed: {}", err.trim());
     }
@@ -55,6 +55,33 @@ pub fn run_for(script: &str, timeout: Duration) -> Result<String> {
         s.pop();
     }
     Ok(s)
+}
+
+/// macOS refused the Automation permission.
+#[derive(Debug)]
+struct Refused;
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("Automation permission refused")
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Runs the read script `batched`, else `stepwise`: the slower one, for when
+/// the app could not answer the batched one. Not when it did not answer at
+/// all (a deadline passed) or refused termrevive: that would only double the
+/// wait.
+pub fn read(batched: &str, stepwise: &str) -> Result<String> {
+    let read = |script: &str| run(&format!("{TXT_HANDLER}{script}"));
+    read(batched).or_else(|e| {
+        if exec::timed_out(&e) || e.chain().any(|c| c.is::<Refused>()) {
+            Err(e)
+        } else {
+            read(stepwise)
+        }
+    })
 }
 
 /// Runs `script` and returns the non-empty lines of its result.

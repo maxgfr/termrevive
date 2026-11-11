@@ -198,8 +198,7 @@ impl Backend for Terminal {
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
-        let read = |script: &str| osa::run(&format!("{}{script}", osa::TXT_HANDLER));
-        let text = read(READ_SCRIPT).or_else(|_| read(READ_SCRIPT_STEPWISE))?;
+        let text = osa::read(READ_SCRIPT, READ_SCRIPT_STEPWISE)?;
         Ok(parse_layout(&text))
     }
 

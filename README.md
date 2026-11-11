@@ -73,10 +73,12 @@ termrevive restore --snapshot ~/.local/state/termrevive/snapshots/<file>.json
 terminal only.
 
 The first save after a reboot keeps the last snapshot from before it as
-`previous-boot.json` (shown at the end of `list`). Until that boot has been
-restored, `restore` and `show` use it rather than the latest snapshot, which by
-then may only hold the fresh windows opened since; they say so, and
-`--snapshot` picks any other. Snapshots and the log are readable by their owner
+`previous-boot.json` (shown at the end of `list`). Until that boot is restored
+or you `termrevive save` by hand, and for a day at most, `restore` and `show`
+use it rather than the latest snapshot, which by then may only hold the fresh
+windows auto-saved since; they say so, and `--snapshot` picks any other. A
+restore that fails leaves this as it was, so a retry restores the same
+snapshot. Snapshots and the log are readable by their owner
 only: command lines can carry secrets.
 
 ### Automatic (optional)

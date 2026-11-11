@@ -21,13 +21,38 @@ fn name(cmd: &Command) -> String {
         .into_owned()
 }
 
+/// A child stopped at its deadline.
+#[derive(Debug)]
+pub struct TimedOut {
+    name: String,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} did not finish within {} s and was stopped",
+            self.name,
+            self.timeout.as_secs_f32()
+        )
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Whether `e` is, or wraps, a child stopped at its deadline.
+pub fn timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<TimedOut>())
+}
+
 fn stop(mut child: Child, name: &str, timeout: Duration) -> anyhow::Error {
     let _ = child.kill();
     let _ = child.wait();
-    anyhow!(
-        "{name} did not finish within {} s and was stopped",
-        timeout.as_secs_f32()
-    )
+    anyhow!(TimedOut {
+        name: name.to_string(),
+        timeout,
+    })
 }
 
 /// Waits for `child` to end, until `deadline`.
@@ -149,6 +174,8 @@ mod tests {
         let started = Instant::now();
         let err = output(Command::new("/bin/sleep").arg("30"), None, short).unwrap_err();
         assert!(err.to_string().contains("sleep did not finish"), "{err}");
+        assert!(timed_out(&err.context("reading")));
+        assert!(!timed_out(&anyhow!("osascript failed")));
         let err = status(Command::new("/bin/sleep").arg("30"), short).unwrap_err();
         assert!(err.to_string().contains("was stopped"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(10));

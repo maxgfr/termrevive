@@ -431,6 +431,9 @@ fn save(backends: &[Box<dyn Backend>], auto: bool, store: &Store, notes: &mut No
     if auto {
         log!("saved {} → {}", summary(&snap), path.display());
     } else {
+        // What is open is what the user wants back: after a reboot, no
+        // longer the snapshot from before it.
+        store.mark_saved_by_hand(&snap.boot())?;
         println!("saved {} → {}", summary(&snap), path.display());
     }
     Ok(())
@@ -445,14 +448,30 @@ enum Pick {
     PreviousBoot,
 }
 
-fn default_snapshot(
-    latest: &Snapshot,
-    previous: Option<&Snapshot>,
-    boot: &Boot,
-    restored: Option<&Boot>,
-) -> Pick {
-    let unrestored_reboot = latest.boot().same(boot) && !restored.is_some_and(|r| r.same(boot));
-    if unrestored_reboot && previous.is_some_and(|p| !p.boot().same(boot)) {
+/// How long after a reboot the snapshot from before it stays the default.
+const PREVIOUS_BOOT_DEFAULT: Duration = Duration::from_secs(24 * 3600);
+
+/// What decides between the latest snapshot and the previous boot's.
+struct Since<'a> {
+    boot: &'a Boot,
+    /// The boot restored last.
+    restored: Option<&'a Boot>,
+    /// The boot during which the user last saved by hand.
+    saved_by_hand: Option<&'a Boot>,
+    /// How long ago the previous boot's snapshot was kept.
+    kept_for: Option<Duration>,
+}
+
+/// The previous boot's snapshot is the default only right after a reboot:
+/// until this boot is restored, or the user saves what is open by hand, and
+/// for a day at most.
+fn default_snapshot(latest: &Snapshot, previous: Option<&Snapshot>, s: &Since) -> Pick {
+    let this_boot = |b: Option<&Boot>| b.is_some_and(|b| b.same(s.boot));
+    let unsettled = latest.boot().same(s.boot)
+        && !this_boot(s.restored)
+        && !this_boot(s.saved_by_hand)
+        && s.kept_for.is_some_and(|d| d < PREVIOUS_BOOT_DEFAULT);
+    if unsettled && previous.is_some_and(|p| !p.boot().same(s.boot)) {
         Pick::PreviousBoot
     } else {
         Pick::Latest
@@ -469,12 +488,14 @@ fn pick(store: &Store, path: Option<PathBuf>) -> Result<Snapshot> {
         .context("no snapshot yet: run `termrevive save` first")?;
     let previous = store.previous_boot().ok().flatten();
     let boot = procs::boot();
-    match default_snapshot(
-        &latest,
-        previous.as_ref(),
-        &boot,
-        store.restored_boot().as_ref(),
-    ) {
+    let (restored, by_hand) = (store.restored_boot(), store.saved_by_hand());
+    let since = Since {
+        boot: &boot,
+        restored: restored.as_ref(),
+        saved_by_hand: by_hand.as_ref(),
+        kept_for: store.previous_boot_age(),
+    };
+    match default_snapshot(&latest, previous.as_ref(), &since) {
         Pick::Latest => Ok(latest),
         Pick::PreviousBoot => {
             let previous = previous.expect("checked by default_snapshot");
@@ -674,8 +695,10 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
         }
     }
     // A manual restore of the whole snapshot is this boot's restore too:
-    // auto-save may go on, and the agent has nothing left to restore.
-    if args.auto || covers(&snap, &names) {
+    // auto-save may go on, and the agent has nothing left to restore. Not
+    // when it failed: a retry must find the same snapshot. The one at login
+    // runs once, whatever happens.
+    if args.auto || (failures.is_empty() && covers(&snap, &names)) {
         store.mark_restored(&boot)?;
     }
     if !failures.is_empty() {
@@ -994,22 +1017,31 @@ mod tests {
         let (old, new) = (boot(1, "A"), boot(2, "B"));
         let before = snap(&old, win("a", "/"));
         let fresh = snap(&new, win("zsh", "/"));
-        // Saves of the fresh windows replaced latest.json.
+        let hour = Some(Duration::from_secs(3600));
+        let since = |restored, saved_by_hand, kept_for| Since {
+            boot: &new,
+            restored,
+            saved_by_hand,
+            kept_for,
+        };
+        // Auto-saves of the fresh windows replaced latest.json.
+        let pick = |s: &Since| default_snapshot(&fresh, Some(&before), s);
         assert_eq!(
-            default_snapshot(&fresh, Some(&before), &new, Some(&old)),
+            pick(&since(Some(&old), Some(&old), hour)),
             Pick::PreviousBoot
         );
-        // This boot was restored: the latest is what the user has now.
-        assert_eq!(
-            default_snapshot(&fresh, Some(&before), &new, Some(&new)),
-            Pick::Latest
-        );
+        // This boot was restored, or saved by hand: the latest is what the
+        // user wants now.
+        assert_eq!(pick(&since(Some(&new), None, hour)), Pick::Latest);
+        assert_eq!(pick(&since(None, Some(&new), hour)), Pick::Latest);
+        // More than a day after the reboot, or no age known.
+        let days = Some(Duration::from_secs(2 * 24 * 3600));
+        assert_eq!(pick(&since(None, None, days)), Pick::Latest);
+        assert_eq!(pick(&since(None, None, None)), Pick::Latest);
         // Nothing saved since the reboot, or nothing kept from before it.
-        assert_eq!(
-            default_snapshot(&before, Some(&before), &new, None),
-            Pick::Latest
-        );
-        assert_eq!(default_snapshot(&fresh, None, &new, None), Pick::Latest);
+        let s = since(None, None, hour);
+        assert_eq!(default_snapshot(&before, Some(&before), &s), Pick::Latest);
+        assert_eq!(default_snapshot(&fresh, None, &s), Pick::Latest);
     }
 
     #[test]

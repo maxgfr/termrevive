@@ -126,20 +126,58 @@ impl Store {
     pub fn write(&self, snap: &Snapshot) -> Result<PathBuf> {
         let dir = self.snapshots_dir();
         create_dir(&dir)?;
-        if let Ok(Some(latest)) = self.latest()
+        // Directories made by termrevive ≤ 1.3.1 were readable by everyone.
+        for d in [&self.dir, &dir] {
+            let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o700));
+        }
+        // Read once: the bytes kept are those of the boot compared.
+        if let Ok(bytes) = fs::read(self.latest_path())
+            && let Ok(latest) = serde_json::from_slice::<Snapshot>(&bytes)
             && !latest.boot().same(&snap.boot())
         {
-            let bytes = fs::read(self.latest_path())?;
             atomic_write(&self.previous_boot_path(), &bytes)?;
         }
         let json = serde_json::to_vec_pretty(snap)?;
         let path = dir.join(format!("{}.json", snap.taken_at.format("%Y%m%d-%H%M%S")));
         atomic_write(&path, &json)?;
         atomic_write(&self.latest_path(), &json)?;
-        for old in self.list()?.into_iter().skip(KEEP) {
-            let _ = fs::remove_file(old);
+        for (i, old) in self.list()?.into_iter().enumerate() {
+            if i >= KEEP {
+                let _ = fs::remove_file(old);
+            } else if fs::metadata(&old).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                make_private(&old);
+            }
         }
         Ok(path)
+    }
+
+    /// How long ago `previous-boot.json` was kept: since the first save of
+    /// the current boot.
+    pub fn previous_boot_age(&self) -> Option<std::time::Duration> {
+        let at = fs::metadata(self.previous_boot_path())
+            .and_then(|m| m.modified())
+            .ok()?;
+        SystemTime::now().duration_since(at).ok()
+    }
+
+    /// The boot during which the user saved by hand: what is open then is
+    /// what they want to keep.
+    pub fn saved_by_hand(&self) -> Option<Boot> {
+        let text = fs::read_to_string(self.dir.join("saved-by-hand")).ok()?;
+        let mut lines = text.lines();
+        let time = lines.next()?.trim().parse().ok()?;
+        let session = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        Some(Boot {
+            time,
+            session: session.map(String::from),
+        })
+    }
+
+    pub fn mark_saved_by_hand(&self, boot: &Boot) -> Result<()> {
+        create_dir(&self.dir)?;
+        let text = format!("{}\n{}\n", boot.time, boot.session.as_deref().unwrap_or(""));
+        fs::write(self.dir.join("saved-by-hand"), text)?;
+        Ok(())
     }
 
     /// Saved snapshots, newest first. They are ordered by when they were
@@ -360,6 +398,39 @@ mod tests {
             assert_eq!(mode(&p), 0o600, "{}", p.display());
         }
         assert_eq!(mode(&store.dir), 0o700);
+        assert!(store.previous_boot_age().unwrap() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn files_of_older_versions_become_private() {
+        let store = scratch("private");
+        let dir = store.snapshots_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("20260101-000000.json");
+        fs::write(&old, "{}").unwrap();
+        for p in [&store.dir, &dir] {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+        store.write(&empty_snapshot(&boot(1, "A"))).unwrap();
+        assert_eq!(
+            (mode(&store.dir), mode(&dir), mode(&old)),
+            (0o700, 0o700, 0o600)
+        );
+    }
+
+    #[test]
+    fn a_save_by_hand_is_recorded_with_its_boot() {
+        let store = scratch("by-hand");
+        assert_eq!(store.saved_by_hand(), None);
+        store.mark_saved_by_hand(&boot(3, "C")).unwrap();
+        assert_eq!(store.saved_by_hand(), Some(boot(3, "C")));
+        let no_session = Boot {
+            time: 4,
+            session: None,
+        };
+        store.mark_saved_by_hand(&no_session).unwrap();
+        assert_eq!(store.saved_by_hand(), Some(no_session));
     }
 
     #[test]

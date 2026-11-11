@@ -341,7 +341,18 @@ impl Backend for Kitty {
                         None => format!("printf %s {} | ", shell_quote(t)),
                     })
                     .unwrap_or_default();
-                let args: Vec<String> = s.args.iter().map(|a| shell_quote(a)).collect();
+                // `$N` stands for an id a previous step returned: left as is.
+                let args: Vec<String> = s
+                    .args
+                    .iter()
+                    .map(|a| {
+                        if a.starts_with("--match=id:$") {
+                            a.clone()
+                        } else {
+                            shell_quote(a)
+                        }
+                    })
+                    .collect();
                 format!("{input}kitten @ {}    # ${i}\n", args.join(" "))
             })
             .collect()
@@ -492,7 +503,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            s.contains(r"printf '%s\r' 'it'\''s' | kitten @ send-text"),
+            s.contains(r"printf '%s\r' 'it'\''s' | kitten @ send-text --match=id:$0 --stdin"),
             "{s}"
         );
     }
