@@ -172,6 +172,15 @@ fn parse_layout(json: &str, procs: &[Proc]) -> Result<RawLayout> {
     Ok(RawLayout { windows })
 }
 
+/// What `doctor --fix` of termrevive ≤ 1.3.1 set: a socket in the shared /tmp.
+const OLD_LISTEN: &str = "unix:/tmp/kitty";
+
+/// Whether `listen_on` gives the remote control a unix socket, other than the
+/// one termrevive used to set in /tmp, which `doctor --fix` moves.
+fn listen_ok(listen: Option<&str>) -> bool {
+    listen.is_some_and(|l| l.starts_with("unix:") && l != OLD_LISTEN)
+}
+
 /// One step of a restore; `$N` in args stands for the id step N returned.
 #[derive(Debug, PartialEq)]
 struct Step {
@@ -400,12 +409,13 @@ impl Backend for Kitty {
             },
             Setting {
                 name: LISTEN,
-                ok: listen.as_deref().is_some_and(|l| l.starts_with("unix:")),
+                ok: listen_ok(listen.as_deref()),
                 current: listen,
                 // kitty expands the variable: a socket in the user's own
                 // temporary directory, not in the shared /tmp.
                 wanted: "unix:${TMPDIR}/kitty",
-                why: "the remote control needs a unix socket (restart kitty after the fix)",
+                why: "the remote control needs a unix socket, in a directory of your own \
+                      rather than the shared /tmp (restart kitty after the fix)",
             },
         ]
     }
@@ -483,6 +493,17 @@ mod tests {
         );
         assert_eq!(s[1].stdin.as_deref(), Some("claude --resume x\r"));
         assert_eq!(s[4].stdin.as_deref(), Some("make"));
+    }
+
+    #[test]
+    fn the_socket_termrevive_used_to_set_in_tmp_is_moved() {
+        assert!(listen_ok(Some("unix:${TMPDIR}/kitty")));
+        assert!(
+            listen_ok(Some("unix:/tmp/mykitty")),
+            "the user's own choice"
+        );
+        assert!(!listen_ok(Some(OLD_LISTEN)));
+        assert!(!listen_ok(Some("tcp:localhost:5000")) && !listen_ok(None));
     }
 
     #[test]
