@@ -6,7 +6,7 @@
 //! is not: it runs a program.
 
 use anyhow::{Context, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -94,14 +94,28 @@ fn included(value: &str, from: &Path, syntax: Syntax) -> Option<PathBuf> {
 fn assignments(files: &[PathBuf], key: &str, syntax: Syntax) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let mut trail = Trail::default();
-    // Every file the terminal loads first, then (Ghostty) what they include.
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    // Every file the terminal loads first, then (Ghostty) the list of files
+    // they include, walked by index as Ghostty does: an empty `config-file`
+    // empties the list, and what is added after it at an index already
+    // passed is never read (checked with Ghostty 1.4.0).
+    let mut list: Vec<PathBuf> = Vec::new();
+    let apply = |list: &mut Vec<PathBuf>, later: Vec<Later>| {
+        for l in later {
+            match l {
+                Some(file) => list.push(file),
+                None => list.clear(),
+            }
+        }
+    };
     for file in files {
-        queue.extend(visit(file, false, key, syntax, &mut trail, &mut out));
+        let later = visit(file, false, key, syntax, &mut trail, &mut out);
+        apply(&mut list, later);
     }
-    while let Some(file) = queue.pop_front() {
+    let mut i = 0;
+    while let Some(file) = list.get(i).cloned() {
+        i += 1;
         let later = visit(&file, true, key, syntax, &mut trail, &mut out);
-        queue.extend(later);
+        apply(&mut list, later);
     }
     out
 }
@@ -138,8 +152,9 @@ fn identity(file: &Path, syntax: Syntax) -> PathBuf {
     }
 }
 
-/// A file read later (Ghostty's `config-file`).
-type Later = PathBuf;
+/// A file read later (Ghostty's `config-file`); `None`: an empty one, which
+/// empties the list of files to read.
+type Later = Option<PathBuf>;
 
 /// Reads `file` (`included` by another, or loaded by the terminal itself)
 /// into `out`; returns the files it includes that are read later.
@@ -186,7 +201,8 @@ fn read_lines(
             continue;
         }
         match (syntax, k) {
-            (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
+            (Syntax::Equals, "config-file") if unquote(v).is_empty() => later.push(None),
+            (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax).map(Some)),
             (Syntax::Space, "include") => {
                 if let Some(inc) = included(v, file, syntax) {
                     later.extend(visit(&inc, true, key, syntax, trail, out));
@@ -527,6 +543,52 @@ mod tests {
             read_key(&files, KEY, Syntax::Equals).as_deref(),
             Some("never")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_config_file_empties_ghosttys_list() {
+        // Each layout checked with Ghostty 1.4.0's +show-config.
+        let dir = std::env::temp_dir().join(format!("termrevive-reset-{}", std::process::id()));
+        let cases = [
+            ("config-file = b\nconfig-file =\n", "", None),
+            (
+                "config-file = a\nconfig-file =\nwindow-save-state = always\n",
+                "",
+                Some("always"),
+            ),
+            (
+                "config-file = b\nconfig-file = \"\"\nconfig-file = a\n",
+                "",
+                Some("never"),
+            ),
+            // From an included file: b is dropped, and c, added at an index
+            // already passed, is never read.
+            (
+                "config-file = a\nconfig-file = b\n",
+                "config-file =\nconfig-file = c\n",
+                None,
+            ),
+        ];
+        for (config, a, want) in cases {
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config"), config).unwrap();
+            let a = if a.is_empty() {
+                "window-save-state = never\n"
+            } else {
+                a
+            };
+            fs::write(dir.join("a"), a).unwrap();
+            fs::write(dir.join("b"), "window-save-state = always\n").unwrap();
+            fs::write(dir.join("c"), "window-save-state = never\n").unwrap();
+            let files = [dir.join("config")];
+            assert_eq!(
+                read_key(&files, KEY, Syntax::Equals).as_deref(),
+                want,
+                "{config:?} / {a:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
