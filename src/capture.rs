@@ -242,10 +242,18 @@ mod tests {
                 }),
             })
         };
+        let plain = args(&["mosh-client", "-# -p 60001 me@host |", "ip", "1"]);
+        let l = launch(mosh_command(&plain).unwrap());
+        assert_eq!(
+            (l.input.as_deref(), l.run),
+            (Some("mosh -p 60001 me@host"), true)
+        );
+        // `--ssh="ssh -p 2222"` and `--ssh=ssh -p 2222` look the same once
+        // joined: typed, not run.
         let l = launch(mosh_command(&client).unwrap());
         assert_eq!(
             (l.input.as_deref(), l.run),
-            (Some("mosh --ssh=ssh -p 2222 me@host"), true)
+            (Some("mosh --ssh=ssh -p 2222 me@host"), false)
         );
         let top = args(&["mosh-client", "-# host -- top |", "ip", "1"]);
         assert!(!launch(mosh_command(&top).unwrap()).run);

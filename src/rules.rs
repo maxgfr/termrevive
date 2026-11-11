@@ -370,10 +370,23 @@ fn render(template: &str, pane: &Pane, quote: bool) -> Option<String> {
 
 /// Whether an `ssh` or `mosh` command line runs a command on the remote host
 /// (`ssh host 'rm -rf build'`) rather than opening a shell there.
+/// For `mosh`, also one with an option whose value is a command line
+/// (`--ssh="ssh -p 2222"`): a live session only tells its arguments joined
+/// with spaces, so such a value may have come back split, with another meaning.
 fn remote_command(argv: &[String]) -> bool {
     let Some(name) = argv.first().map(|a| crate::procs::basename(a)) else {
         return false;
     };
+    let command_valued = ["--ssh", "--server", "--client"];
+    if name == "mosh"
+        && argv[1..].iter().any(|a| {
+            command_valued
+                .iter()
+                .any(|o| a == o || a.starts_with(&format!("{o}=")))
+        })
+    {
+        return true;
+    }
     // Options that take a value, as `-p 22` or `-p22`.
     let (short, long): (&str, &[&str]) = match name {
         "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", &[]),
@@ -656,7 +669,6 @@ mod tests {
             "ssh -vA -i key host",
             "ssh -o ServerAliveInterval=30 host",
             "mosh host",
-            "mosh --ssh=ssh -p 22 host",
             "mosh -p 60001 host",
         ] {
             assert!(run(shell), "{shell}");
@@ -667,6 +679,8 @@ mod tests {
             "ssh -p 22 host -- ls",
             "mosh host -- tmux attach",
             "mosh --ssh ssh host top",
+            "mosh --ssh=ssh -p 22 host",
+            "mosh --server='mosh-server new' host",
         ] {
             assert!(!run(command), "{command}");
         }
