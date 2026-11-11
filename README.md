@@ -72,6 +72,13 @@ termrevive restore --snapshot ~/.local/state/termrevive/snapshots/<file>.json
 (it would duplicate them); `--force` overrides that, `--backend` restores one
 terminal only.
 
+The first save after a reboot keeps the last snapshot from before it as
+`previous-boot.json` (shown at the end of `list`). Until that boot has been
+restored, `restore` and `show` use it rather than the latest snapshot, which by
+then may only hold the fresh windows opened since; they say so, and
+`--snapshot` picks any other. Snapshots and the log are readable by their owner
+only: command lines can carry secrets.
+
 ### Automatic (optional)
 
 ```sh
@@ -96,7 +103,11 @@ trigger it each time; `install` replaces them).
 - Auto-restore runs at login, only from a snapshot of a previous boot, once per
   boot. It starts each terminal if needed and closes its blank startup window.
   Installing it also applies `doctor --fix`.
-- Log: `~/.local/state/termrevive/logs/agent.log`.
+- Log: `~/.local/state/termrevive/logs/agent.log`. A skip or a warning is
+  logged when it appears, not again while it repeats; past 1 MB the log moves
+  to `agent.log.1`. A terminal that stops answering is given up after a minute
+  (longer for a restore, in proportion to its panes) instead of blocking the
+  agent.
 - launchd does not pass your shell's environment on: `install` copies the
   variables that move termrevive's or an agent's files (`XDG_STATE_HOME`,
   `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
@@ -140,16 +151,22 @@ run = false
 Your rules come first (matched on the program or on the harness name), then
 each harness's resume command for agent sessions, then the built-ins
 (`builtin_rules = false` to drop them): editors, pagers, `ssh`, `htop`,
-`lazygit`… → rerun `{argv}`. Variables: `{argv}`, `{cwd}`, `{session_id}`,
-`{session_cwd}`, `{session_name}` (`{claude_session_id}`, `{claude_cwd}`,
-`{claude_name}` still work). Commands are typed in your interactive shell, so
-aliases (`claude=…`) apply.
+`lazygit`… → rerun `{argv}`; an `ssh` or `mosh` that runs a command on the
+remote host (`ssh host 'rm -rf build'`) is only typed. Variables: `{argv}`,
+`{cwd}`, `{session_id}`, `{session_cwd}`, `{session_name}`
+(`{claude_session_id}`, `{claude_cwd}`, `{claude_name}` still work); a literal
+brace is `{{` or `}}` (`awk '{{print $1}}'`), and `termrevive doctor` points
+out a template that can't be filled. A rule without `cwd` runs in the pane's
+directory, or, when it matches an agent session, in the session's own
+directory (its project or worktree). Commands are typed in your interactive
+shell, so aliases (`claude=…`) apply.
 
 ## How it works
 
 Each terminal's scripting interface (AppleScript, or `kitten @` for kitty) lists
-windows → tabs → panes. termrevive reads the process table (shell and
-foreground job of each tty, exact argv via `KERN_PROCARGS2`, cwd via libproc),
+windows → tabs → panes. termrevive reads the process table from the kernel
+(shell and foreground job of each tty via libproc, exact argv via
+`KERN_PROCARGS2`, cwd via libproc),
 asks each harness whether one of a pane's processes is its CLI and which
 session it works on, then pairs every pane with its shell: exactly when the
 terminal reports the pane's tty (iTerm2, Terminal.app) or shell pid (kitty), by

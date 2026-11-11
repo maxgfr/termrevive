@@ -32,7 +32,9 @@ LaunchAgents, `doctor` — is shared and needs no change.
      `launch`, `wait_ready`, `records`, `close_windows`), `conf.rs`
      (`key value` / `key = value` config files), `defaults.rs` (`defaults
      read/write`, the `ApplePersistenceIgnoreState` setting), and
-     `procs::pids_by_exe` for `host_pids`.
+     `procs::pids_by_exe` for `host_pids`. Run any other program through
+     `exec::output` / `exec::status`, which stop it past a deadline: a child
+     that hangs must not block the agent.
 3. **Register it**: one line in `registry()` in `src/backend/mod.rs`.
 4. **Test it** with fixtures, no terminal needed: parse a captured read output
    (AppleScript records or JSON) into a `RawLayout`, and check the restore
@@ -75,7 +77,8 @@ rules (`match = "<name>"`, `{session_id}`), snapshots and restore are shared.
    - `resume_command`: what to type in the pane's shell (quote ids with
      `rules::shell_quote`).
    - Honor the agent's own home override (`CODEX_HOME`, `VIBE_HOME`…) through
-     `home_dir_from` / `xdg_data`.
+     `home_dir_from` / `xdg_data`, and run any program (`sqlite3`…) through
+     `exec::output`, which stops it past a deadline.
 3. **Register it**: one line in `registry()` in `src/harness/mod.rs`.
 4. **Test it** with fixtures in a temp dir (session files, a small SQLite
    database): which session a process gets, that stale or foreign sessions are

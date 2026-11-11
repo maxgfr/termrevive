@@ -23,7 +23,7 @@ Every command takes `--backend ghostty|iterm2|kitty|terminal` to act on one term
 
 ## Restore
 
-1. `termrevive show` (or `--snapshot <file>` from `list`) and tell the user what will open.
+1. `termrevive show` (or `--snapshot <file>` from `list`) and tell the user what will open. After a reboot that was not restored yet, `show` and `restore` use the last snapshot from before the reboot (`previous-boot.json`) and print a note saying so; relay it.
 2. `termrevive restore`. It refuses when a terminal already has more than one pane open, because it would duplicate them; that includes the tab you are running in plus any other. Do not add `--force` on your own: tell the user, and let them close the extra tabs, confirm the duplication, or restore only the other terminals with `--backend`.
 3. `termrevive restore --dry-run` prints the AppleScript without running it, when the user wants to check first.
 
@@ -31,7 +31,7 @@ Panes open one after another (`delay_ms` in the config, 300 ms by default), so a
 
 ## Automatic mode
 
-`termrevive install` adds one LaunchAgent, started at login: it restores (`--auto-restore` alone; this also applies `doctor --fix`), then saves every 2 minutes (`--interval` to change, `--auto-save` alone). Auto-save skips while no terminal runs or all are empty, while a restore runs, and after a reboot until that boot's restore happened, so an empty terminal never overwrites the snapshot to restore. These change the user's login items and Ghostty config: ask before running `install` or `uninstall`. The log is `~/.local/state/termrevive/logs/agent.log`. After a `brew upgrade`, the agent must be reinstalled (`termrevive install`).
+`termrevive install` adds one LaunchAgent, started at login: it restores (`--auto-restore` alone; this also applies `doctor --fix`), then saves every 2 minutes (`--interval` to change, `--auto-save` alone). Auto-save skips while no terminal runs or all are empty, while a restore runs, and after a reboot until that boot's restore happened, so an empty terminal never overwrites the snapshot to restore. These change the user's login items and Ghostty config: ask before running `install` or `uninstall`. The log is `~/.local/state/termrevive/logs/agent.log` (a repeated skip or warning is logged once; past 1 MB it moves to `agent.log.1`). After a `brew upgrade`, the agent must be reinstalled (`termrevive install`).
 
 ## Tune what gets relaunched
 
@@ -40,7 +40,7 @@ Panes open one after another (`delay_ms` in the config, 300 ms by default), so a
 ```toml
 [[rule]]
 match = ["npm", "pnpm"]
-command = "{argv}"      # {argv} {cwd} {claude_session_id} {claude_cwd} {claude_name}
+command = "{argv}"      # {argv} {cwd} {session_id} {session_cwd} {session_name}
 run = false             # type it without pressing Enter
 
 [default]
@@ -48,4 +48,4 @@ command = "{argv}"
 run = false
 ```
 
-Keep unknown or side-effecting commands (`make deploy`, scripts that write) at `run = false`. After editing, `termrevive doctor` validates the file and `termrevive show` shows the effect on the latest snapshot.
+`match` also takes a harness name (`"codex"`), and a rule without `cwd` on an agent session runs in the session's directory. A literal brace is `{{` or `}}`. Keep unknown or side-effecting commands (`make deploy`, scripts that write) at `run = false`; the built-in rules already type an `ssh` that runs a remote command without pressing Enter. After editing, `termrevive doctor` validates the file (including templates that cannot be filled) and `termrevive show` shows the effect on the latest snapshot.
