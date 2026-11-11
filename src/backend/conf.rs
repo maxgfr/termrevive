@@ -145,7 +145,7 @@ fn read_lines(
         match (syntax, k) {
             (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
             (Syntax::Space, "include") => {
-                for inc in included(v, file, syntax) {
+                if let Some(inc) = included(v, file, syntax) {
                     later.extend(visit(&inc, key, syntax, seen, out));
                 }
             }
