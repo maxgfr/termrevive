@@ -13,10 +13,12 @@ mod store;
 use anyhow::{Context, Result, bail};
 use backend::{Backend, Caps, TabPlan, WindowPlan};
 use clap::{Parser, Subcommand};
-use model::{Snapshot, Window};
+use model::{Boot, Snapshot, Window};
 use rules::Config;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
+use store::Store;
 
 /// Save and restore terminal sessions: windows, tabs, splits, working
 /// directories and the programs running in them, for Ghostty, iTerm2, kitty
@@ -42,9 +44,11 @@ enum Cmd {
         #[arg(long)]
         auto: bool,
     },
-    /// Recreate the windows of a snapshot and relaunch their programs.
+    /// Recreate the windows of a snapshot and relaunch their programs. By
+    /// default, the latest snapshot; after a reboot that was not restored
+    /// yet, the last one taken before it.
     Restore {
-        /// Snapshot file to use instead of the latest one.
+        /// Snapshot file to use instead.
         #[arg(long)]
         snapshot: Option<PathBuf>,
         /// Print what would run instead of running it.
@@ -113,12 +117,16 @@ macro_rules! log {
 }
 
 fn main() {
-    // Exit quietly when the reader goes away (`termrevive show | head`).
-    // SAFETY: restoring the default SIGPIPE disposition has no preconditions.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
     let cli = Cli::parse();
+    // Exit quietly when the reader goes away (`termrevive show | head`). Not
+    // the agent: a child that exits before reading its input would end it
+    // without a word.
+    if !matches!(cli.cmd, Cmd::Agent { .. }) {
+        // SAFETY: restoring the default SIGPIPE disposition has no preconditions.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     if let Err(e) = run(cli) {
         eprintln!("termrevive: {e:#}");
         std::process::exit(1);
@@ -127,16 +135,26 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let backends = backend::select(&cli.backend)?;
+    let store = Store::open();
     match cli.cmd {
-        Cmd::Save { auto } => save(&backends, auto),
+        Cmd::Save { auto } => save(&backends, auto, &store, &mut Notes::new(auto)),
         Cmd::Restore {
             snapshot,
             dry_run,
             force,
             auto,
-        } => restore(&cli.backend, snapshot, dry_run, force, auto),
-        Cmd::Show { snapshot } => show(&load(snapshot)?, &Config::load()?),
-        Cmd::List => list(),
+        } => restore(
+            &RestoreArgs {
+                selection: &cli.backend,
+                path: snapshot,
+                dry_run,
+                force,
+                auto,
+            },
+            &store,
+        ),
+        Cmd::Show { snapshot } => show(&pick(&store, snapshot)?, &Config::load()?),
+        Cmd::List => list(&store),
         Cmd::Install {
             auto_save,
             auto_restore,
@@ -155,10 +173,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("removed the previous agent {}", p.display());
             }
             println!("installed {} ({})", path.display(), describe(&config));
-            println!(
-                "log: {}",
-                store::state_dir().join("logs/agent.log").display()
-            );
+            println!("log: {}", store.log_path().display());
             Ok(())
         }
         Cmd::Uninstall => {
@@ -170,13 +185,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Agent {
             restore,
             save_every,
-        } => agent(&cli.backend, &backends, restore, save_every),
+        } => agent(&cli.backend, &backends, restore, save_every, &store),
         Cmd::Config { init } => config(init),
         Cmd::Doctor { fix } => {
             if fix {
                 fix_settings(&backends)?;
             }
-            doctor(&backends)
+            doctor(&backends, &store)
         }
         Cmd::Skill => {
             print!("{SKILL}");
@@ -200,6 +215,44 @@ fn describe(c: &launchd::AgentConfig) -> String {
     }
 }
 
+/// Skips and warnings. On the command line they go to stderr. The agent logs
+/// each one when it appears, not again while it repeats from one save to the
+/// next: an unreadable terminal would otherwise log the same lines every tick.
+struct Notes {
+    auto: bool,
+    previous: HashSet<String>,
+    current: HashSet<String>,
+}
+
+impl Notes {
+    fn new(auto: bool) -> Notes {
+        Notes {
+            auto,
+            previous: HashSet::new(),
+            current: HashSet::new(),
+        }
+    }
+
+    /// Whether `msg` is new since the previous tick; records it for the next.
+    fn fresh(&mut self, msg: &str) -> bool {
+        self.current.insert(msg.to_string());
+        !self.previous.contains(msg)
+    }
+
+    fn note(&mut self, msg: String) {
+        if !self.auto {
+            eprintln!("{msg}");
+        } else if self.fresh(&msg) {
+            log!("{msg}");
+        }
+    }
+
+    /// Ends a tick: what was noted becomes what repeats.
+    fn tick(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+}
+
 /// The LaunchAgent's process: restore once, then save in a loop. Errors are
 /// logged and the loop goes on.
 fn agent(
@@ -207,18 +260,32 @@ fn agent(
     backends: &[Box<dyn Backend>],
     restore_first: bool,
     save_every: Option<u64>,
+    store: &Store,
 ) -> Result<()> {
+    store.rotate_log();
     log!("agent started (version {})", env!("CARGO_PKG_VERSION"));
-    if restore_first && let Err(e) = restore(selection, None, false, false, true) {
-        log!("restore failed: {e:#}");
+    if restore_first {
+        let args = RestoreArgs {
+            selection,
+            path: None,
+            dry_run: false,
+            force: false,
+            auto: true,
+        };
+        if let Err(e) = restore(&args, store) {
+            log!("restore failed: {e:#}");
+        }
     }
     let Some(every) = save_every else {
         return Ok(());
     };
+    let mut notes = Notes::new(true);
     loop {
-        if let Err(e) = save(backends, true) {
-            log!("save failed: {e:#}");
+        if let Err(e) = save(backends, true, store, &mut notes) {
+            notes.note(format!("save failed: {e:#}"));
         }
+        notes.tick();
+        store.rotate_log();
         std::thread::sleep(Duration::from_secs(every.max(30)));
     }
 }
@@ -272,65 +339,95 @@ fn same_layout(a: &[Window], b: &[Window]) -> bool {
     norm(a) == norm(b)
 }
 
-fn save(backends: &[Box<dyn Backend>], auto: bool) -> Result<()> {
-    let note = |msg: String| {
-        if auto {
-            log!("{msg}")
-        } else {
-            eprintln!("{msg}")
-        }
-    };
-    if auto && store::RestoreLock::held() {
-        note("skip: a restore is running".into());
-        return Ok(());
-    }
-    let cap = capture::capture(backends)?;
-    for (_, e) in &cap.errors {
-        note(format!("warning: {e}"));
-    }
-    let Some(mut snap) = cap.snapshot else {
-        if auto {
-            log!("skip: no supported terminal is running");
-            return Ok(());
-        }
-        bail!("no supported terminal is running ({})", backend::names());
-    };
-    let latest = store::latest().ok().flatten();
-    // A terminal that runs but could not be read keeps its windows from the
-    // previous snapshot rather than vanishing from this one.
-    if let Some(l) = &latest {
-        for (name, _) in &cap.errors {
+/// A terminal that runs but could not be read (`unreadable`, by name) keeps
+/// its windows from the previous snapshot rather than vanishing from this one.
+fn carry_over(snap: &mut Snapshot, latest: Option<&Snapshot>, unreadable: &[(String, String)]) {
+    if let Some(l) = latest {
+        for (name, _) in unreadable {
             snap.windows
                 .extend(l.windows.iter().filter(|w| &w.backend == name).cloned());
         }
     }
+}
+
+/// What auto-save does with a capture.
+#[derive(Debug, PartialEq)]
+enum AutoSave {
+    Write,
+    /// Same layout as the latest snapshot.
+    Unchanged,
+    /// After a reboot, before that boot's restore: the terminals may only
+    /// show their own fresh windows, which must not replace the snapshot
+    /// still to be restored.
+    WaitForRestore,
+}
+
+fn auto_save(
+    latest: Option<&Snapshot>,
+    snap: &Snapshot,
+    restored: Option<&Boot>,
+    restores_at_login: impl FnOnce() -> bool,
+) -> AutoSave {
+    let Some(latest) = latest else {
+        return AutoSave::Write;
+    };
+    let boot = snap.boot();
+    if latest.boot().same(&boot) {
+        return if same_layout(&latest.windows, &snap.windows) {
+            AutoSave::Unchanged
+        } else {
+            AutoSave::Write
+        };
+    }
+    // Reading the agent's plist costs a process: only after a reboot.
+    if !restored.is_some_and(|r| r.same(&boot)) && restores_at_login() {
+        AutoSave::WaitForRestore
+    } else {
+        AutoSave::Write
+    }
+}
+
+fn save(backends: &[Box<dyn Backend>], auto: bool, store: &Store, notes: &mut Notes) -> Result<()> {
+    if auto && store.restoring() {
+        notes.note("skip: a restore is running".into());
+        return Ok(());
+    }
+    let cap = capture::capture(backends, &procs::boot())?;
+    for (_, e) in &cap.errors {
+        notes.note(format!("warning: {e}"));
+    }
+    let Some(mut snap) = cap.snapshot else {
+        if auto {
+            notes.note("skip: no supported terminal is running".into());
+            return Ok(());
+        }
+        bail!("no supported terminal is running ({})", backend::names());
+    };
+    let latest = store.latest().ok().flatten();
+    carry_over(&mut snap, latest.as_ref(), &cap.errors);
     if snap.pane_count() == 0 {
         if auto {
-            log!("skip: no open terminal");
+            notes.note("skip: no open terminal".into());
             return Ok(());
         }
         bail!("no open terminal to save");
     }
     if auto {
-        // Right after a reboot the terminals may only show their own fresh
-        // windows: never let that overwrite the snapshot still to be restored.
-        // Reading the agent's plist costs a process: only after a reboot.
-        let pending = latest.as_ref().is_some_and(|l| {
-            l.boot_time < snap.boot_time
-                && store::restored_boot() != Some(snap.boot_time)
-                && launchd::restores_at_login()
-        });
-        if pending {
-            log!("skip: waiting for the auto-restore of this boot");
-            return Ok(());
-        }
-        if latest.as_ref().is_some_and(|l| {
-            l.boot_time == snap.boot_time && same_layout(&l.windows, &snap.windows)
-        }) {
-            return Ok(());
+        match auto_save(
+            latest.as_ref(),
+            &snap,
+            store.restored_boot().as_ref(),
+            launchd::restores_at_login,
+        ) {
+            AutoSave::Write => {}
+            AutoSave::Unchanged => return Ok(()),
+            AutoSave::WaitForRestore => {
+                notes.note("skip: waiting for the auto-restore of this boot".into());
+                return Ok(());
+            }
         }
     }
-    let path = store::write(&snap)?;
+    let path = store.write(&snap)?;
     if auto {
         log!("saved {} → {}", summary(&snap), path.display());
     } else {
@@ -339,10 +436,56 @@ fn save(backends: &[Box<dyn Backend>], auto: bool) -> Result<()> {
     Ok(())
 }
 
-fn load(path: Option<PathBuf>) -> Result<Snapshot> {
-    match path {
-        Some(p) => store::read(&p),
-        None => store::latest()?.context("no snapshot yet: run `termrevive save` first"),
+/// Which snapshot `restore` and `show` use when none is named.
+#[derive(Debug, PartialEq)]
+enum Pick {
+    Latest,
+    /// The latest snapshot is from this boot, which nothing restored yet:
+    /// saves of the fresh windows replaced the one from before the reboot.
+    PreviousBoot,
+}
+
+fn default_snapshot(
+    latest: &Snapshot,
+    previous: Option<&Snapshot>,
+    boot: &Boot,
+    restored: Option<&Boot>,
+) -> Pick {
+    let unrestored_reboot = latest.boot().same(boot) && !restored.is_some_and(|r| r.same(boot));
+    if unrestored_reboot && previous.is_some_and(|p| !p.boot().same(boot)) {
+        Pick::PreviousBoot
+    } else {
+        Pick::Latest
+    }
+}
+
+/// The snapshot at `path`, or the default one (see [`Pick`]).
+fn pick(store: &Store, path: Option<PathBuf>) -> Result<Snapshot> {
+    if let Some(p) = path {
+        return store::read(&p);
+    }
+    let latest = store
+        .latest()?
+        .context("no snapshot yet: run `termrevive save` first")?;
+    let previous = store.previous_boot().ok().flatten();
+    let boot = procs::boot();
+    match default_snapshot(
+        &latest,
+        previous.as_ref(),
+        &boot,
+        store.restored_boot().as_ref(),
+    ) {
+        Pick::Latest => Ok(latest),
+        Pick::PreviousBoot => {
+            let previous = previous.expect("checked by default_snapshot");
+            eprintln!(
+                "note: this boot was not restored yet, so this is the last snapshot from before \
+                 it ({}); `--snapshot {}` uses the latest",
+                previous.taken_at.format("%F %T"),
+                store.latest_path().display()
+            );
+            Ok(previous)
+        }
     }
 }
 
@@ -384,6 +527,21 @@ fn covers(snap: &Snapshot, names: &[String]) -> bool {
     snap.backends().iter().all(|b| names.contains(b))
 }
 
+/// Why the restore at login has nothing to do, if it has not.
+fn auto_restore_skip(
+    snap: &Snapshot,
+    boot: &Boot,
+    restored: Option<&Boot>,
+) -> Option<&'static str> {
+    if snap.boot().same(boot) {
+        Some("latest snapshot is from this boot")
+    } else if restored.is_some_and(|r| r.same(boot)) {
+        Some("already restored for this boot")
+    } else {
+        None
+    }
+}
+
 /// Panes currently open in `b`.
 fn open_panes(b: &dyn Backend, procs: &[procs::Proc]) -> Result<usize> {
     Ok(b.read_layout(procs)?
@@ -394,15 +552,31 @@ fn open_panes(b: &dyn Backend, procs: &[procs::Proc]) -> Result<usize> {
         .sum())
 }
 
-fn restore(
-    selection: &str,
+struct RestoreArgs<'a> {
+    selection: &'a str,
     path: Option<PathBuf>,
     dry_run: bool,
     force: bool,
     auto: bool,
-) -> Result<()> {
+}
+
+fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
     let cfg = Config::load()?;
-    let snap = load(path)?;
+    let boot = procs::boot();
+    let snap = if args.auto {
+        // At login: the latest snapshot or nothing.
+        let snap = store
+            .latest()?
+            .context("no snapshot yet: run `termrevive save` first")?;
+        if let Some(why) = auto_restore_skip(&snap, &boot, store.restored_boot().as_ref()) {
+            log!("skip: {why}");
+            return Ok(());
+        }
+        snap
+    } else {
+        pick(store, args.path.clone())?
+    };
+    let selection = args.selection;
     let names: Vec<String> = snap
         .backends()
         .into_iter()
@@ -425,7 +599,7 @@ fn restore(
         let plans: Vec<WindowPlan> = plan(&windows, &cfg, b.caps()).into_iter().rev().collect();
         groups.push((b, plans));
     }
-    if dry_run {
+    if args.dry_run {
         for (b, plans) in &groups {
             println!("# {}", b.display_name());
             for p in plans {
@@ -435,24 +609,12 @@ fn restore(
         return Ok(());
     }
 
-    let boot = procs::boot_time();
-    if auto {
-        if snap.boot_time >= boot {
-            log!("skip: latest snapshot is from this boot");
-            return Ok(());
-        }
-        if store::restored_boot() == Some(boot) {
-            log!("skip: already restored for this boot");
-            return Ok(());
-        }
-    }
-
     // Check every terminal before touching any.
     let procs = procs::process_table()?;
     let mut was_running = Vec::new();
     for (b, _) in &groups {
         let running = b.running(&procs);
-        if running && !force && !auto {
+        if running && !args.force && !args.auto {
             let open = open_panes(b.as_ref(), &procs)?;
             if open > 1 {
                 bail!(
@@ -466,9 +628,9 @@ fn restore(
         was_running.push(running);
     }
 
-    let _lock = store::RestoreLock::acquire()?;
+    let _lock = store.lock()?;
     let say = |msg: String| {
-        if auto {
+        if args.auto {
             log!("{msg}")
         } else {
             println!("{msg}")
@@ -513,8 +675,8 @@ fn restore(
     }
     // A manual restore of the whole snapshot is this boot's restore too:
     // auto-save may go on, and the agent has nothing left to restore.
-    if auto || covers(&snap, &names) {
-        store::mark_restored(boot)?;
+    if args.auto || covers(&snap, &names) {
+        store.mark_restored(&boot)?;
     }
     if !failures.is_empty() {
         bail!("could not restore {}", failures.join(", "));
@@ -549,16 +711,22 @@ fn show(snap: &Snapshot, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn list() -> Result<()> {
-    let paths = store::list()?;
+fn list(store: &Store) -> Result<()> {
+    let line = |p: &std::path::Path| match store::read(p) {
+        Ok(s) => println!("{}  {}", p.display(), summary(&s)),
+        Err(e) => println!("{}  (unreadable: {e})", p.display()),
+    };
+    let paths = store.list()?;
     if paths.is_empty() {
         println!("no snapshot yet");
     }
-    for p in paths {
-        match store::read(&p) {
-            Ok(s) => println!("{}  {}", p.display(), summary(&s)),
-            Err(e) => println!("{}  (unreadable: {e})", p.display()),
-        }
+    for p in &paths {
+        line(p);
+    }
+    let previous = store.previous_boot_path();
+    if previous.exists() {
+        println!("\nlast snapshot of the previous boot:");
+        line(&previous);
     }
     Ok(())
 }
@@ -601,7 +769,7 @@ fn fix_settings(backends: &[Box<dyn Backend>]) -> Result<()> {
     Ok(())
 }
 
-fn doctor(backends: &[Box<dyn Backend>]) -> Result<()> {
+fn doctor(backends: &[Box<dyn Backend>], store: &Store) -> Result<()> {
     let ok = |b: bool| if b { "ok  " } else { "warn" };
     let procs = procs::process_table()?;
     for b in backends {
@@ -647,7 +815,7 @@ fn doctor(backends: &[Box<dyn Backend>]) -> Result<()> {
             legacy.join(", ")
         );
     }
-    match store::latest() {
+    match store.latest() {
         Ok(Some(s)) => println!(
             "[ok  ] latest snapshot {}: {}",
             s.taken_at.format("%F %T"),
@@ -658,7 +826,15 @@ fn doctor(backends: &[Box<dyn Backend>]) -> Result<()> {
     }
     match rules::config_path() {
         Some(p) if p.exists() => match Config::load() {
-            Ok(_) => println!("[ok  ] config {}", p.display()),
+            Ok(cfg) => {
+                let problems = cfg.problems();
+                if problems.is_empty() {
+                    println!("[ok  ] config {}", p.display());
+                }
+                for problem in problems {
+                    println!("[warn] config {}: {problem}", p.display());
+                }
+            }
             Err(e) => println!("[warn] config: {e:#}"),
         },
         _ => println!("[ok  ] config: built-in defaults"),
@@ -687,6 +863,20 @@ mod tests {
         }]
     }
 
+    fn boot(time: i64, session: &str) -> Boot {
+        Boot {
+            time,
+            session: Some(session.into()),
+        }
+    }
+
+    fn snap(boot: &Boot, windows: Vec<Window>) -> Snapshot {
+        Snapshot {
+            windows,
+            ..store::empty_snapshot(boot)
+        }
+    }
+
     #[test]
     fn spinner_glyphs_do_not_count_as_changes() {
         assert!(same_layout(
@@ -705,13 +895,7 @@ mod tests {
         let mut windows = win("a", "/");
         windows.extend(win("b", "/"));
         windows[1].backend = "iterm2".into();
-        let snap = Snapshot {
-            version: model::SNAPSHOT_VERSION,
-            taken_at: chrono::Local::now(),
-            boot_time: 1,
-            backend: String::new(),
-            windows,
-        };
+        let snap = snap(&boot(1, "A"), windows);
         let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(covers(&snap, &names(&["ghostty", "iterm2"])));
         assert!(!covers(&snap, &names(&["ghostty"])), "--backend ghostty");
@@ -729,5 +913,118 @@ mod tests {
         let flat = plan(&[&w], &cfg, Caps { splits: false });
         assert_eq!(flat[0].tabs.len(), 2);
         assert!(flat[0].tabs[0].selected && !flat[0].tabs[1].selected);
+    }
+
+    #[test]
+    fn auto_save_writes_changes_and_waits_for_the_restore_after_a_reboot() {
+        let (old, new) = (boot(1, "A"), boot(2, "B"));
+        let before = snap(&old, win("a", "/a"));
+        let fresh = snap(&new, win("zsh", "/"));
+        let never = || -> bool { panic!("the plist is read only after a reboot") };
+
+        assert_eq!(auto_save(None, &fresh, None, never), AutoSave::Write);
+        let same = snap(&old, win("◐ a", "/a"));
+        assert_eq!(
+            auto_save(Some(&before), &same, None, never),
+            AutoSave::Unchanged
+        );
+        let moved = snap(&old, win("a", "/b"));
+        assert_eq!(
+            auto_save(Some(&before), &moved, None, never),
+            AutoSave::Write
+        );
+
+        // After a reboot, with auto-restore on: wait until this boot's restore.
+        assert_eq!(
+            auto_save(Some(&before), &fresh, Some(&old), || true),
+            AutoSave::WaitForRestore
+        );
+        assert_eq!(
+            auto_save(Some(&before), &fresh, Some(&new), never),
+            AutoSave::Write
+        );
+        // Auto-save only: written (the store keeps the previous boot's).
+        assert_eq!(
+            auto_save(Some(&before), &fresh, None, || false),
+            AutoSave::Write
+        );
+    }
+
+    #[test]
+    fn unreadable_terminals_keep_their_previous_windows() {
+        let mut latest = win("g", "/g");
+        latest.extend(win("i", "/i"));
+        latest[1].backend = "iterm2".into();
+        let latest = snap(&boot(1, "A"), latest);
+        let mut now = snap(&boot(1, "A"), win("g2", "/g2"));
+        carry_over(
+            &mut now,
+            Some(&latest),
+            &[("iterm2".into(), "refused".into())],
+        );
+        let titles: Vec<&str> = now
+            .windows
+            .iter()
+            .map(|w| w.tabs[0].title.as_str())
+            .collect();
+        assert_eq!(titles, ["g2", "i"]);
+        carry_over(&mut now, None, &[("iterm2".into(), "refused".into())]);
+        assert_eq!(now.windows.len(), 2);
+    }
+
+    #[test]
+    fn the_restore_at_login_runs_once_per_boot_from_an_earlier_one() {
+        let (old, new) = (boot(1, "A"), boot(2, "B"));
+        let before = snap(&old, win("a", "/"));
+        assert_eq!(auto_restore_skip(&before, &new, None), None);
+        assert_eq!(auto_restore_skip(&before, &new, Some(&old)), None);
+        assert_eq!(
+            auto_restore_skip(&before, &new, Some(&new)),
+            Some("already restored for this boot")
+        );
+        let after = snap(&new, win("a", "/"));
+        assert_eq!(
+            auto_restore_skip(&after, &new, None),
+            Some("latest snapshot is from this boot")
+        );
+    }
+
+    #[test]
+    fn an_unrestored_reboot_defaults_to_the_snapshot_from_before_it() {
+        let (old, new) = (boot(1, "A"), boot(2, "B"));
+        let before = snap(&old, win("a", "/"));
+        let fresh = snap(&new, win("zsh", "/"));
+        // Saves of the fresh windows replaced latest.json.
+        assert_eq!(
+            default_snapshot(&fresh, Some(&before), &new, Some(&old)),
+            Pick::PreviousBoot
+        );
+        // This boot was restored: the latest is what the user has now.
+        assert_eq!(
+            default_snapshot(&fresh, Some(&before), &new, Some(&new)),
+            Pick::Latest
+        );
+        // Nothing saved since the reboot, or nothing kept from before it.
+        assert_eq!(
+            default_snapshot(&before, Some(&before), &new, None),
+            Pick::Latest
+        );
+        assert_eq!(default_snapshot(&fresh, None, &new, None), Pick::Latest);
+    }
+
+    #[test]
+    fn the_agent_logs_a_repeated_note_once() {
+        let mut notes = Notes::new(true);
+        assert!(notes.fresh("warning: x"));
+        assert!(
+            notes.fresh("warning: x"),
+            "twice in a tick is the same tick"
+        );
+        notes.tick();
+        assert!(!notes.fresh("warning: x"), "repeated");
+        assert!(notes.fresh("skip: y"));
+        notes.tick();
+        notes.tick(); // a tick without it
+        assert!(notes.fresh("warning: x"), "back after a pause");
     }
 }

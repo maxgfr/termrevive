@@ -10,6 +10,10 @@ pub struct Snapshot {
     pub taken_at: DateTime<Local>,
     /// `kern.boottime` (seconds) of the boot during which the snapshot was taken.
     pub boot_time: i64,
+    /// `kern.bootsessionuuid` of that boot; absent from snapshots of
+    /// termrevive ≤ 1.3.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_session: Option<String>,
     /// Version 1 snapshots name their single terminal here; version 2 ones
     /// name it on each window. [`Snapshot::normalize`] moves it down.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -78,7 +82,36 @@ pub struct LegacyClaude {
     pub name: Option<String>,
 }
 
+/// One boot of the machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Boot {
+    /// `kern.boottime`, in seconds. It is derived from the wall clock, so a
+    /// clock step can shift it.
+    pub time: i64,
+    /// `kern.bootsessionuuid`: exact, when known.
+    pub session: Option<String>,
+}
+
+impl Boot {
+    /// Whether both are the same boot: by session when both know theirs,
+    /// else by boot time.
+    pub fn same(&self, other: &Boot) -> bool {
+        match (&self.session, &other.session) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.time == other.time,
+        }
+    }
+}
+
 impl Snapshot {
+    /// The boot during which it was taken.
+    pub fn boot(&self) -> Boot {
+        Boot {
+            time: self.boot_time,
+            session: self.boot_session.clone(),
+        }
+    }
+
     /// Upgrades an older snapshot in memory: v1's single terminal moves onto
     /// each window, v1/v2's Claude session becomes an agent session.
     pub fn normalize(mut self) -> Snapshot {
@@ -181,5 +214,21 @@ mod tests {
         assert_eq!(s.agent_counts(), vec![("claude".to_string(), 1)]);
         let v3 = serde_json::to_string(&s).unwrap();
         assert!(v3.contains(r#""agent":{"harness":"claude""#) && !v3.contains(r#""claude":{"#));
+        assert!(!v3.contains("boot_session"), "unknown, so not written");
+    }
+
+    #[test]
+    fn boots_are_told_apart_by_session_when_both_know_it() {
+        let b = |time, session: Option<&str>| Boot {
+            time,
+            session: session.map(String::from),
+        };
+        // A clock step moved the boot time: still the same boot.
+        assert!(b(100, Some("A")).same(&b(103, Some("A"))));
+        // Same second, another boot.
+        assert!(!b(100, Some("A")).same(&b(100, Some("B"))));
+        // A snapshot of termrevive ≤ 1.3.1: by time.
+        assert!(b(100, None).same(&b(100, Some("A"))));
+        assert!(!b(100, None).same(&b(200, Some("A"))));
     }
 }

@@ -339,6 +339,36 @@ pub fn boot_time() -> i64 {
     tv.tv_sec
 }
 
+/// `kern.bootsessionuuid`: a new one at every boot.
+fn boot_session() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut size = buf.len();
+    // SAFETY: the kernel writes at most `size` bytes into `buf`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&buf[..size.min(buf.len())]);
+    let s = s.trim_end_matches('\0').trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The current boot.
+pub fn boot() -> crate::model::Boot {
+    crate::model::Boot {
+        time: boot_time(),
+        session: boot_session(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +499,9 @@ mod tests {
         assert!(boot_time() > 0);
         let me = start_time(std::process::id() as i32).unwrap();
         assert!(me >= boot_time() && me <= chrono::Local::now().timestamp());
+        let boot = boot();
+        let uuid = boot.session.expect("kern.bootsessionuuid");
+        assert_eq!(uuid.len(), 36, "{uuid}");
+        assert_eq!(uuid.matches('-').count(), 4, "{uuid}");
     }
 }

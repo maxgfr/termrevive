@@ -5,7 +5,7 @@
 use crate::backend::{Backend, short_tty};
 use crate::harness::{self, AgentProc, Harness};
 use crate::matcher::{self, Candidate};
-use crate::model::{AgentSession, Program, SNAPSHOT_VERSION, Snapshot, Window};
+use crate::model::{AgentSession, Boot, Program, SNAPSHOT_VERSION, Snapshot, Window};
 use crate::procs::{self, Proc, TtySession};
 use anyhow::Result;
 use std::collections::HashSet;
@@ -18,7 +18,8 @@ pub struct Capture {
     pub errors: Vec<(String, String)>,
 }
 
-pub fn capture(backends: &[Box<dyn Backend>]) -> Result<Capture> {
+/// Snapshots the running terminals among `backends`, during the boot `boot`.
+pub fn capture(backends: &[Box<dyn Backend>], boot: &Boot) -> Result<Capture> {
     let procs = procs::process_table()?;
     let harnesses = harness::registry();
     // A session goes to one pane only, even when several CLIs could claim it.
@@ -37,7 +38,8 @@ pub fn capture(backends: &[Box<dyn Backend>]) -> Result<Capture> {
     let snapshot = any_running.then(|| Snapshot {
         version: SNAPSHOT_VERSION,
         taken_at: chrono::Local::now(),
-        boot_time: procs::boot_time(),
+        boot_time: boot.time,
+        boot_session: boot.session.clone(),
         backend: String::new(),
         windows,
     });
