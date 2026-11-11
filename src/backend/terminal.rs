@@ -18,7 +18,36 @@ pub struct Terminal;
 const BUNDLE: &str = "com.apple.Terminal";
 const EXE_SUFFIX: &str = "Terminal.app/Contents/MacOS/Terminal";
 
+/// Reads every window in five Apple events, whatever they hold: each property
+/// is asked for all the windows, or all the tabs of all the windows, at once
+/// (Terminal.app shows each tab as a window, so asking per window gains
+/// nothing).
 const READ_SCRIPT: &str = r#"
+set US to character id 31
+set RS to character id 30
+set out to ""
+tell application "Terminal"
+	set winIds to id of windows
+	set winNames to name of windows
+	set tabSel to selected of tabs of windows
+	set tabTitles to custom title of tabs of windows
+	set tabTtys to tty of tabs of windows
+	set n to count of winIds
+	if (count of winNames) is not n or (count of tabSel) is not n or (count of tabTitles) is not n or (count of tabTtys) is not n then error "the windows changed while they were read"
+	repeat with wi from 1 to n
+		set out to out & "W" & US & (item wi of winIds) & US & my txt(item wi of winNames) & RS
+		set m to count of (item wi of tabTtys)
+		if (count of (item wi of tabSel)) is not m or (count of (item wi of tabTitles)) is not m then error "the tabs changed while they were read"
+		repeat with ti from 1 to m
+			set out to out & "T" & US & my txt(item ti of item wi of tabSel) & US & my txt(item ti of item wi of tabTitles) & US & my txt(item ti of item wi of tabTtys) & RS
+		end repeat
+	end repeat
+end tell
+return out
+"#;
+
+/// The same read, one window and one tab at a time: when the one above fails.
+const READ_SCRIPT_STEPWISE: &str = r#"
 set US to character id 31
 set RS to character id 30
 set out to ""
@@ -169,10 +198,9 @@ impl Backend for Terminal {
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
-        Ok(parse_layout(&osa::run(&format!(
-            "{}{READ_SCRIPT}",
-            osa::TXT_HANDLER
-        ))?))
+        let read = |script: &str| osa::run(&format!("{}{script}", osa::TXT_HANDLER));
+        let text = read(READ_SCRIPT).or_else(|_| read(READ_SCRIPT_STEPWISE))?;
+        Ok(parse_layout(&text))
     }
 
     fn ensure_running(&self) -> Result<()> {

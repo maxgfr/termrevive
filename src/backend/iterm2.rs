@@ -16,7 +16,50 @@ pub struct Iterm2;
 const BUNDLE: &str = "com.googlecode.iterm2";
 const EXE_SUFFIX: &str = "iTerm.app/Contents/MacOS/iTerm2";
 
+/// Reads a window in six Apple events, whatever it holds: each property is
+/// asked for all its tabs, or all the sessions of all its tabs, at once,
+/// instead of one event per property per pane. A result that is not the
+/// expected nested list is an error, and the stepwise read takes over.
 const READ_SCRIPT: &str = r#"
+set US to character id 31
+set RS to character id 30
+set out to ""
+tell application "iTerm2"
+	repeat with w in windows
+		set cur to ""
+		try
+			set cur to id of current session of w
+		end try
+		set out to out & "W" & US & (id of w) & US & cur & RS
+		set sessIds to id of sessions of tabs of w
+		set sessNames to name of sessions of tabs of w
+		set sessTtys to tty of sessions of tabs of w
+		set n to count of sessIds
+		set ttls to {}
+		try
+			set ttls to title of tabs of w
+		end try
+		if (count of ttls) is not n then set ttls to {}
+		if (count of sessNames) is not n or (count of sessTtys) is not n then error "the tabs changed while they were read"
+		repeat with ti from 1 to n
+			set ids to item ti of sessIds
+			if class of ids is not list then error "sessions are not listed per tab"
+			set m to count of ids
+			if (count of (item ti of sessNames)) is not m or (count of (item ti of sessTtys)) is not m then error "the sessions changed while they were read"
+			set ttl to ""
+			if ttls is not {} then set ttl to my txt(item ti of ttls)
+			set out to out & "T" & US & ttl & RS
+			repeat with si from 1 to m
+				set out to out & "S" & US & (item si of ids) & US & my txt(item si of item ti of sessNames) & US & my txt(item si of item ti of sessTtys) & RS
+			end repeat
+		end repeat
+	end repeat
+end tell
+return out
+"#;
+
+/// The same read, one tab and one session at a time: when the one above fails.
+const READ_SCRIPT_STEPWISE: &str = r#"
 set US to character id 31
 set RS to character id 30
 set out to ""
@@ -126,10 +169,9 @@ impl Backend for Iterm2 {
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
-        Ok(parse_layout(&osa::run(&format!(
-            "{}{READ_SCRIPT}",
-            osa::TXT_HANDLER
-        ))?))
+        let read = |script: &str| osa::run(&format!("{}{script}", osa::TXT_HANDLER));
+        let text = read(READ_SCRIPT).or_else(|_| read(READ_SCRIPT_STEPWISE))?;
+        Ok(parse_layout(&text))
     }
 
     fn ensure_running(&self) -> Result<()> {
