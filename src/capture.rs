@@ -97,6 +97,22 @@ fn capture_one(
     Ok(windows)
 }
 
+/// The `mosh` command line a `mosh-client` was started from. `mosh` connects,
+/// then replaces itself with `mosh-client "-# <its arguments> |" <ip> <port>`:
+/// rerunning that would need the session key, while `mosh <arguments>`
+/// connects again. The arguments were joined with spaces, so one that held a
+/// space comes back split.
+fn mosh_command(argv: &[String]) -> Option<Vec<String>> {
+    if procs::basename(argv.first()?) != "mosh-client" {
+        return None;
+    }
+    let args = argv.get(1)?.strip_prefix("-#")?;
+    let args = args.strip_suffix('|').unwrap_or(args);
+    let mut out = vec!["mosh".to_string()];
+    out.extend(args.split_whitespace().map(String::from));
+    (out.len() > 1).then_some(out)
+}
+
 /// The agent CLI a harness recognizes on the session's tty (whatever wraps
 /// it, e.g. `caffeinate`), lowest pid first.
 fn agent_on(
@@ -172,6 +188,7 @@ fn programs(
             }
             None => sessions[i].fg.as_ref().map(|fg| {
                 let argv = procs::argv(fg.pid).unwrap_or_else(|| vec![fg.comm.clone()]);
+                let argv = mosh_command(&argv).unwrap_or(argv);
                 Program {
                     name: procs::basename(&argv[0]).to_string(),
                     argv,
@@ -182,4 +199,55 @@ fn programs(
         };
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Pane;
+    use crate::rules::Config;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn a_mosh_client_comes_back_as_the_mosh_it_was_started_from() {
+        let client = args(&[
+            "mosh-client",
+            "-# --ssh=ssh -p 2222 me@host |",
+            "10.0.0.2",
+            "60001",
+        ]);
+        assert_eq!(
+            mosh_command(&client),
+            Some(args(&["mosh", "--ssh=ssh", "-p", "2222", "me@host"]))
+        );
+        assert_eq!(mosh_command(&args(&["nvim", "-# x |"])), None);
+        assert_eq!(
+            mosh_command(&args(&["/usr/local/bin/mosh-client", "-# |", "ip", "1"])),
+            None
+        );
+
+        // The built-in rule then reruns it, or only types it when it runs a
+        // remote command.
+        let launch = |argv: Vec<String>| {
+            Config::default().launch(&Pane {
+                title: String::new(),
+                cwd: "/".into(),
+                program: Some(Program {
+                    name: procs::basename(&argv[0]).to_string(),
+                    argv,
+                    ..Default::default()
+                }),
+            })
+        };
+        let l = launch(mosh_command(&client).unwrap());
+        assert_eq!(
+            (l.input.as_deref(), l.run),
+            (Some("mosh --ssh=ssh -p 2222 me@host"), true)
+        );
+        let top = args(&["mosh-client", "-# host -- top |", "ip", "1"]);
+        assert!(!launch(mosh_command(&top).unwrap()).run);
+    }
 }
