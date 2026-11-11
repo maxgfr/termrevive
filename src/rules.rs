@@ -377,15 +377,18 @@ fn remote_command(argv: &[String]) -> bool {
     let Some(name) = argv.first().map(|a| crate::procs::basename(a)) else {
         return false;
     };
-    // mosh's option parser also takes an unambiguous abbreviation (`--ss`).
+    // mosh parses its options with Perl's Getopt::Long defaults: `--ssh`,
+    // `-ssh` or `+ssh`, in any case, abbreviated while unambiguous (`--ss`).
     let command_valued = ["ssh", "server", "client"];
     if name == "mosh"
-        && argv[1..].iter().any(|a| {
+        && argv[1..].iter().take_while(|a| *a != "--").any(|a| {
             let opt = a
                 .strip_prefix("--")
-                .map(|o| o.split('=').next().unwrap_or(o))
-                .unwrap_or("");
-            !opt.is_empty() && command_valued.iter().any(|o| o.starts_with(opt))
+                .or_else(|| a.strip_prefix('-'))
+                .or_else(|| a.strip_prefix('+'))
+                .map(|o| o.split('=').next().unwrap_or(o).to_ascii_lowercase())
+                .unwrap_or_default();
+            !opt.is_empty() && command_valued.iter().any(|o| o.starts_with(&opt))
         })
     {
         return true;
@@ -686,6 +689,9 @@ mod tests {
             "mosh --server='mosh-server new' host",
             "mosh --ss=ssh -p 22 host",
             "mosh --cl mosh-client host",
+            "mosh -ssh=ssh -p 22 host",
+            "mosh --SSH=ssh -p 22 host",
+            "mosh +ssh=ssh -p 22 host",
         ] {
             assert!(!run(command), "{command}");
         }
