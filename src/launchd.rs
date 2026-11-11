@@ -23,7 +23,7 @@ pub struct AgentConfig {
 }
 
 pub fn plist_path(label: &str) -> Result<PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(crate::paths::home()
         .context("no home directory")?
         .join("Library/LaunchAgents")
         .join(format!("{label}.plist")))

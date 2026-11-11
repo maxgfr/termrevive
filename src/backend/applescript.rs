@@ -133,7 +133,7 @@ pub fn records(text: &str) -> impl Iterator<Item = Vec<&str>> {
 
 /// Whether an app bundle with this name is installed.
 pub fn app_installed(app: &str) -> bool {
-    let home = dirs::home_dir().unwrap_or_default();
+    let home = crate::paths::home().unwrap_or_default();
     [
         std::path::PathBuf::from("/Applications"),
         std::path::PathBuf::from("/System/Applications/Utilities"),

@@ -34,7 +34,7 @@ pub fn enable(domain: &str, key: &str) -> Result<PathBuf> {
     if !status.success() {
         bail!("`defaults write {domain} {key}` failed");
     }
-    Ok(dirs::home_dir()
+    Ok(crate::paths::home()
         .unwrap_or_default()
         .join("Library/Preferences")
         .join(format!("{domain}.plist")))

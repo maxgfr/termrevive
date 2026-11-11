@@ -79,7 +79,7 @@ return out
 
 /// Ghostty's config files on macOS, in load order (a later one overrides).
 fn config_files() -> Vec<PathBuf> {
-    let (Some(xdg), Some(home)) = (conf::xdg_dir("ghostty"), dirs::home_dir()) else {
+    let (Some(xdg), Some(home)) = (conf::xdg_dir("ghostty"), crate::paths::home()) else {
         return Vec::new();
     };
     let support = home.join("Library/Application Support/com.mitchellh.ghostty");

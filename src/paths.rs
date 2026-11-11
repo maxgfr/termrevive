@@ -4,10 +4,15 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// The home directory: `$HOME`, else the user database's.
+pub fn home() -> Option<PathBuf> {
+    std::env::home_dir().filter(|h| !h.as_os_str().is_empty())
+}
+
 /// `$VAR`, else `~/<default>`. A variable set to nothing counts as unset, as
 /// the XDG specification asks.
 pub fn env_or_home(var: &str, default: &str) -> Option<PathBuf> {
-    pick(std::env::var_os(var), dirs::home_dir(), default)
+    pick(std::env::var_os(var), home(), default)
 }
 
 fn pick(value: Option<OsString>, home: Option<PathBuf>, default: &str) -> Option<PathBuf> {
