@@ -362,10 +362,12 @@ enum AutoSave {
     WaitForRestore,
 }
 
+/// `restored`: the boot restored last; `tried`: the boot whose restore at
+/// login failed, which has nothing left to wait for.
 fn auto_save(
     latest: Option<&Snapshot>,
     snap: &Snapshot,
-    restored: Option<&Boot>,
+    (restored, tried): (Option<&Boot>, Option<&Boot>),
     restores_at_login: impl FnOnce() -> bool,
 ) -> AutoSave {
     let Some(latest) = latest else {
@@ -380,7 +382,8 @@ fn auto_save(
         };
     }
     // Reading the agent's plist costs a process: only after a reboot.
-    if !restored.is_some_and(|r| r.same(&boot)) && restores_at_login() {
+    let this_boot = |b: Option<&Boot>| b.is_some_and(|b| b.same(&boot));
+    if !this_boot(restored) && !this_boot(tried) && restores_at_login() {
         AutoSave::WaitForRestore
     } else {
         AutoSave::Write
@@ -413,10 +416,11 @@ fn save(backends: &[Box<dyn Backend>], auto: bool, store: &Store, notes: &mut No
         bail!("no open terminal to save");
     }
     if auto {
+        let (restored, tried) = (store.restored_boot(), store.login_restore_failed());
         match auto_save(
             latest.as_ref(),
             &snap,
-            store.restored_boot().as_ref(),
+            (restored.as_ref(), tried.as_ref()),
             launchd::restores_at_login,
         ) {
             AutoSave::Write => {}
@@ -443,6 +447,9 @@ fn save(backends: &[Box<dyn Backend>], auto: bool, store: &Store, notes: &mut No
 #[derive(Debug, PartialEq)]
 enum Pick {
     Latest,
+    /// The latest, though one from before the reboot is still kept, unused
+    /// as the default since it is more than a day old.
+    LatestPreviousKept,
     /// The latest snapshot is from this boot, which nothing restored yet:
     /// saves of the fresh windows replaced the one from before the reboot.
     PreviousBoot,
@@ -467,14 +474,16 @@ struct Since<'a> {
 /// for a day at most.
 fn default_snapshot(latest: &Snapshot, previous: Option<&Snapshot>, s: &Since) -> Pick {
     let this_boot = |b: Option<&Boot>| b.is_some_and(|b| b.same(s.boot));
-    let unsettled = latest.boot().same(s.boot)
-        && !this_boot(s.restored)
-        && !this_boot(s.saved_by_hand)
-        && s.kept_for.is_some_and(|d| d < PREVIOUS_BOOT_DEFAULT);
-    if unsettled && previous.is_some_and(|p| !p.boot().same(s.boot)) {
-        Pick::PreviousBoot
-    } else {
-        Pick::Latest
+    let unsettled =
+        latest.boot().same(s.boot) && !this_boot(s.restored) && !this_boot(s.saved_by_hand);
+    let kept = previous.is_some_and(|p| !p.boot().same(s.boot));
+    match (
+        unsettled && kept,
+        s.kept_for.is_some_and(|d| d < PREVIOUS_BOOT_DEFAULT),
+    ) {
+        (true, true) => Pick::PreviousBoot,
+        (true, false) => Pick::LatestPreviousKept,
+        (false, _) => Pick::Latest,
     }
 }
 
@@ -497,6 +506,13 @@ fn pick(store: &Store, path: Option<PathBuf>) -> Result<Snapshot> {
     };
     match default_snapshot(&latest, previous.as_ref(), &since) {
         Pick::Latest => Ok(latest),
+        Pick::LatestPreviousKept => {
+            eprintln!(
+                "note: the last snapshot from before this boot is still kept: `--snapshot {}`",
+                store.previous_boot_path().display()
+            );
+            Ok(latest)
+        }
         Pick::PreviousBoot => {
             let previous = previous.expect("checked by default_snapshot");
             eprintln!(
@@ -552,12 +568,14 @@ fn covers(snap: &Snapshot, names: &[String]) -> bool {
 fn auto_restore_skip(
     snap: &Snapshot,
     boot: &Boot,
-    restored: Option<&Boot>,
+    (restored, tried): (Option<&Boot>, Option<&Boot>),
 ) -> Option<&'static str> {
     if snap.boot().same(boot) {
         Some("latest snapshot is from this boot")
     } else if restored.is_some_and(|r| r.same(boot)) {
         Some("already restored for this boot")
+    } else if tried.is_some_and(|r| r.same(boot)) {
+        Some("the restore of this boot failed; `termrevive restore` retries it")
     } else {
         None
     }
@@ -589,7 +607,8 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
         let snap = store
             .latest()?
             .context("no snapshot yet: run `termrevive save` first")?;
-        if let Some(why) = auto_restore_skip(&snap, &boot, store.restored_boot().as_ref()) {
+        let (restored, tried) = (store.restored_boot(), store.login_restore_failed());
+        if let Some(why) = auto_restore_skip(&snap, &boot, (restored.as_ref(), tried.as_ref())) {
             log!("skip: {why}");
             return Ok(());
         }
@@ -728,13 +747,15 @@ fn replay(
             failures.push(b.display_name());
         }
     }
-    // A manual restore of the whole snapshot is this boot's restore too:
-    // auto-save may go on, and the agent has nothing left to restore. Not
-    // when it failed, or left a terminal out: a retry must find the same
-    // snapshot. The one at login runs once, whatever happens.
+    // A restore of the whole snapshot is this boot's restore: auto-save may
+    // go on, and the agent has nothing left to restore. Not when it failed,
+    // or left a terminal out: a retry by hand must find the same snapshot.
+    // The one at login is not tried again during the boot either way.
     let restored: Vec<String> = groups.iter().map(|(b, _)| b.name().to_string()).collect();
-    if r.auto || (failures.is_empty() && covers(r.snap, &restored)) {
+    if failures.is_empty() && covers(r.snap, &restored) {
         store.mark_restored(r.boot)?;
+    } else if r.auto {
+        store.mark_login_restore_failed(r.boot)?;
     }
     if !failures.is_empty() {
         bail!("could not restore {}", failures.join(", "));
@@ -980,30 +1001,37 @@ mod tests {
         let fresh = snap(&new, win("zsh", "/"));
         let never = || -> bool { panic!("the plist is read only after a reboot") };
 
-        assert_eq!(auto_save(None, &fresh, None, never), AutoSave::Write);
+        let none = (None, None);
+        assert_eq!(auto_save(None, &fresh, none, never), AutoSave::Write);
         let same = snap(&old, win("◐ a", "/a"));
         assert_eq!(
-            auto_save(Some(&before), &same, None, never),
+            auto_save(Some(&before), &same, none, never),
             AutoSave::Unchanged
         );
         let moved = snap(&old, win("a", "/b"));
         assert_eq!(
-            auto_save(Some(&before), &moved, None, never),
+            auto_save(Some(&before), &moved, none, never),
             AutoSave::Write
         );
 
         // After a reboot, with auto-restore on: wait until this boot's restore.
         assert_eq!(
-            auto_save(Some(&before), &fresh, Some(&old), || true),
+            auto_save(Some(&before), &fresh, (Some(&old), None), || true),
             AutoSave::WaitForRestore
         );
         assert_eq!(
-            auto_save(Some(&before), &fresh, Some(&new), never),
+            auto_save(Some(&before), &fresh, (Some(&new), None), never),
             AutoSave::Write
         );
-        // Auto-save only: written (the store keeps the previous boot's).
+        // It failed: nothing left to wait for (the store keeps the previous
+        // boot's snapshot, the default of a retry by hand).
         assert_eq!(
-            auto_save(Some(&before), &fresh, None, || false),
+            auto_save(Some(&before), &fresh, (Some(&old), Some(&new)), never),
+            AutoSave::Write
+        );
+        // Auto-save only: written.
+        assert_eq!(
+            auto_save(Some(&before), &fresh, none, || false),
             AutoSave::Write
         );
     }
@@ -1034,15 +1062,23 @@ mod tests {
     fn the_restore_at_login_runs_once_per_boot_from_an_earlier_one() {
         let (old, new) = (boot(1, "A"), boot(2, "B"));
         let before = snap(&old, win("a", "/"));
-        assert_eq!(auto_restore_skip(&before, &new, None), None);
-        assert_eq!(auto_restore_skip(&before, &new, Some(&old)), None);
+        assert_eq!(auto_restore_skip(&before, &new, (None, None)), None);
         assert_eq!(
-            auto_restore_skip(&before, &new, Some(&new)),
+            auto_restore_skip(&before, &new, (Some(&old), Some(&old))),
+            None
+        );
+        assert_eq!(
+            auto_restore_skip(&before, &new, (Some(&new), None)),
             Some("already restored for this boot")
+        );
+        assert!(
+            auto_restore_skip(&before, &new, (None, Some(&new)))
+                .is_some_and(|why| why.contains("failed")),
+            "an agent restarted by launchd does not try again"
         );
         let after = snap(&new, win("a", "/"));
         assert_eq!(
-            auto_restore_skip(&after, &new, None),
+            auto_restore_skip(&after, &new, (None, None)),
             Some("latest snapshot is from this boot")
         );
     }
@@ -1069,10 +1105,11 @@ mod tests {
         // user wants now.
         assert_eq!(pick(&since(Some(&new), None, hour)), Pick::Latest);
         assert_eq!(pick(&since(None, Some(&new), hour)), Pick::Latest);
-        // More than a day after the reboot, or no age known.
+        // More than a day after the reboot, or no age known: the latest,
+        // with a word about the one kept.
         let days = Some(Duration::from_secs(2 * 24 * 3600));
-        assert_eq!(pick(&since(None, None, days)), Pick::Latest);
-        assert_eq!(pick(&since(None, None, None)), Pick::Latest);
+        assert_eq!(pick(&since(None, None, days)), Pick::LatestPreviousKept);
+        assert_eq!(pick(&since(None, None, None)), Pick::LatestPreviousKept);
         // Nothing saved since the reboot, or nothing kept from before it.
         let s = since(None, None, hour);
         assert_eq!(default_snapshot(&before, Some(&before), &s), Pick::Latest);
@@ -1274,9 +1311,21 @@ mod tests {
         replay_with(&groups()[..1], &s, &store, (false, false)).unwrap();
         assert_eq!(store.restored_boot(), None);
 
-        // At login it runs once, whatever happens.
+        // At login it is not tried again, yet the boot is not restored: a
+        // retry by hand restores the snapshot from before the reboot.
         let store = store::scratch("replay-login");
         assert!(replay_with(&groups(), &s, &store, (false, true)).is_err());
+        assert_eq!(store.restored_boot(), None);
+        assert_eq!(store.login_restore_failed(), Some(boot(2, "B")));
+        let store = store::scratch("replay-login-ok");
+        let one = || vec![(fake("ghostty", true, 0, false, &calls), one_window())];
+        replay_with(
+            &one(),
+            &snap(&boot(1, "A"), win("a", "/")),
+            &store,
+            (false, true),
+        )
+        .unwrap();
         assert_eq!(store.restored_boot(), Some(boot(2, "B")));
     }
 

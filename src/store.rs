@@ -163,7 +163,26 @@ impl Store {
     /// The boot during which the user saved by hand: what is open then is
     /// what they want to keep.
     pub fn saved_by_hand(&self) -> Option<Boot> {
-        let text = fs::read_to_string(self.dir.join("saved-by-hand")).ok()?;
+        self.read_boot("saved-by-hand")
+    }
+
+    pub fn mark_saved_by_hand(&self, boot: &Boot) -> Result<()> {
+        self.write_boot("saved-by-hand", boot)
+    }
+
+    /// The boot whose restore at login ran and failed: it is not tried again
+    /// during that boot, yet the boot does not count as restored.
+    pub fn login_restore_failed(&self) -> Option<Boot> {
+        self.read_boot("login-restore-failed")
+    }
+
+    pub fn mark_login_restore_failed(&self, boot: &Boot) -> Result<()> {
+        self.write_boot("login-restore-failed", boot)
+    }
+
+    /// A boot in a marker file: its time, then its session on a second line.
+    fn read_boot(&self, name: &str) -> Option<Boot> {
+        let text = fs::read_to_string(self.dir.join(name)).ok()?;
         let mut lines = text.lines();
         let time = lines.next()?.trim().parse().ok()?;
         let session = lines.next().map(str::trim).filter(|s| !s.is_empty());
@@ -173,10 +192,10 @@ impl Store {
         })
     }
 
-    pub fn mark_saved_by_hand(&self, boot: &Boot) -> Result<()> {
+    fn write_boot(&self, name: &str, boot: &Boot) -> Result<()> {
         create_dir(&self.dir)?;
         let text = format!("{}\n{}\n", boot.time, boot.session.as_deref().unwrap_or(""));
-        fs::write(self.dir.join("saved-by-hand"), text)?;
+        fs::write(self.dir.join(name), text)?;
         Ok(())
     }
 
@@ -431,6 +450,9 @@ mod tests {
         };
         store.mark_saved_by_hand(&no_session).unwrap();
         assert_eq!(store.saved_by_hand(), Some(no_session));
+        assert_eq!(store.login_restore_failed(), None);
+        store.mark_login_restore_failed(&boot(5, "E")).unwrap();
+        assert_eq!(store.login_restore_failed(), Some(boot(5, "E")));
     }
 
     #[test]
