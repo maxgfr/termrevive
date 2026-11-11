@@ -73,8 +73,16 @@ impl std::error::Error for Refused {}
 /// the app could not answer the batched one. Not when it did not answer at
 /// all (a deadline passed) or refused termrevive: that would only double the
 /// wait.
-pub fn read(batched: &str, stepwise: &str) -> Result<String> {
-    let read = |script: &str| run(&format!("{TXT_HANDLER}{script}"));
+///
+/// Both start by checking that the app (`bundle`) still runs: `tell
+/// application` would launch one quit since termrevive saw it, and the read
+/// returns nothing instead.
+pub fn read(bundle: &str, batched: &str, stepwise: &str) -> Result<String> {
+    let guard = format!(
+        "if application id {} is not running then return \"\"\n",
+        str(bundle)
+    );
+    let read = |script: &str| run(&format!("{TXT_HANDLER}{guard}{script}"));
     read(batched).or_else(|e| {
         if exec::timed_out(&e) || e.chain().any(|c| c.is::<Refused>()) {
             Err(e)

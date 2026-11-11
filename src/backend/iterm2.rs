@@ -169,7 +169,7 @@ impl Backend for Iterm2 {
     }
 
     fn read_layout(&self, _procs: &[Proc]) -> Result<RawLayout> {
-        let text = osa::read(READ_SCRIPT, READ_SCRIPT_STEPWISE)?;
+        let text = osa::read(BUNDLE, READ_SCRIPT, READ_SCRIPT_STEPWISE)?;
         Ok(parse_layout(&text))
     }
 
