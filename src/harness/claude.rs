@@ -45,6 +45,45 @@ fn registered(p: &AgentProc) -> Option<SessionFile> {
     registered_in(&sessions_dir()?, p)
 }
 
+/// Subcommands that are not the interactive CLI. `attach` is: it opens a
+/// background session in the pane.
+const NOT_INTERACTIVE: &[&str] = &[
+    "agents",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "import",
+    "install",
+    "logs",
+    "mcp",
+    "plugin",
+    "plugins",
+    "purge",
+    "respawn",
+    "rm",
+    "setup-token",
+    "stop",
+    "kill",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
+
+/// Whether `argv` starts the interactive CLI: not `claude -p …` (print and
+/// exit), `claude mcp serve`, `claude doctor`…
+fn interactive(argv: &[String]) -> bool {
+    let mut args = argv.iter().skip(1).peekable();
+    // `node …/cli.js …`: the script is not an argument.
+    args.next_if(|a| a.ends_with(".js") || a.ends_with(".mjs"));
+    let args: Vec<&String> = args.collect();
+    let one_shot = ["-p", "--print", "-h", "--help", "-v", "--version"];
+    !args.iter().any(|a| one_shot.contains(&a.as_str()))
+        && !args
+            .first()
+            .is_some_and(|a| NOT_INTERACTIVE.contains(&a.as_str()))
+}
+
 fn session(entry: SessionFile) -> AgentSession {
     AgentSession {
         harness: "claude".into(),
@@ -64,7 +103,7 @@ impl Harness for Claude {
     }
 
     fn is_cli(&self, p: &AgentProc) -> bool {
-        p.name == "claude" || registered(p).is_some()
+        interactive(&p.argv) && (p.name == "claude" || registered(p).is_some())
     }
 
     fn sessions(&self, p: &AgentProc, _procs: &[Proc]) -> Vec<AgentSession> {
@@ -114,6 +153,49 @@ mod tests {
         assert_eq!(Claude.resume_command(&s), "claude --resume abc");
         assert!(registered_in(&dir, &proc(4243, None)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_shot_commands_are_not_the_cli() {
+        let cli = |line: &str| {
+            let argv: Vec<String> = line.split(' ').map(String::from).collect();
+            Claude.is_cli(&AgentProc {
+                name: crate::procs::basename(&argv[0]).to_string(),
+                argv,
+                ..proc(1, None)
+            })
+        };
+        for yes in [
+            "claude",
+            "claude --resume abc",
+            "claude -c",
+            "claude attach 3f2a",
+            "claude fix the mcp server",
+            "/Users/me/.local/bin/claude --model opus",
+        ] {
+            assert!(cli(yes), "{yes}");
+        }
+        for no in [
+            "claude -p hello",
+            "claude --print --output-format json",
+            "claude mcp serve",
+            "claude doctor",
+            "claude update",
+            "claude --version",
+            "codex",
+        ] {
+            assert!(!cli(no), "{no}");
+        }
+        assert!(interactive(&[
+            "node".into(),
+            "/x/cli.js".into(),
+            "-c".into()
+        ]));
+        assert!(!interactive(&[
+            "node".into(),
+            "/x/cli.js".into(),
+            "mcp".into()
+        ]));
     }
 
     #[test]
