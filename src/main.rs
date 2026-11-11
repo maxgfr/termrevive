@@ -630,13 +630,54 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
         return Ok(());
     }
 
-    // Check every terminal before touching any.
     let procs = procs::process_table()?;
+    let say = |msg: String| {
+        if args.auto {
+            log!("{msg}")
+        } else {
+            println!("{msg}")
+        }
+    };
+    replay(
+        &groups,
+        &Replay {
+            procs: &procs,
+            snap: &snap,
+            boot: &boot,
+            force: args.force,
+            auto: args.auto,
+            delay_ms: cfg.restore.delay_ms,
+        },
+        store,
+        &say,
+    )
+}
+
+/// What a restore runs with.
+struct Replay<'a> {
+    procs: &'a [procs::Proc],
+    snap: &'a Snapshot,
+    boot: &'a Boot,
+    force: bool,
+    auto: bool,
+    delay_ms: u64,
+}
+
+/// Rebuilds the windows of `groups` (each terminal with its plans), once
+/// every terminal was checked, under the restore lock; records the boot as
+/// restored when that is what happened.
+fn replay(
+    groups: &[(Box<dyn Backend>, Vec<WindowPlan>)],
+    r: &Replay,
+    store: &Store,
+    say: &dyn Fn(String),
+) -> Result<()> {
+    // Check every terminal before touching any.
     let mut was_running = Vec::new();
-    for (b, _) in &groups {
-        let running = b.running(&procs);
-        if running && !args.force && !args.auto {
-            let open = open_panes(b.as_ref(), &procs)?;
+    for (b, _) in groups {
+        let running = b.running(r.procs);
+        if running && !r.force && !r.auto {
+            let open = open_panes(b.as_ref(), r.procs)?;
             if open > 1 {
                 bail!(
                     "{} already has {open} panes open; restoring would duplicate them. Close \
@@ -650,17 +691,10 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
     }
 
     let _lock = store.lock()?;
-    let say = |msg: String| {
-        if args.auto {
-            log!("{msg}")
-        } else {
-            println!("{msg}")
-        }
-    };
     say(format!(
         "restoring {} from {}",
-        summary(&snap),
-        snap.taken_at.format("%F %T")
+        summary(r.snap),
+        r.snap.taken_at.format("%F %T")
     ));
     let mut failures = Vec::new();
     for ((b, plans), was_running) in groups.iter().zip(was_running) {
@@ -675,9 +709,9 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
             };
             for (i, p) in plans.iter().enumerate() {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_millis(cfg.restore.delay_ms));
+                    std::thread::sleep(Duration::from_millis(r.delay_ms));
                 }
-                b.restore_window(p, cfg.restore.delay_ms)
+                b.restore_window(p, r.delay_ms)
                     .with_context(|| format!("restoring window {}/{}", i + 1, plans.len()))?;
                 say(format!(
                     "{}: window {}/{} done ({} tab(s))",
@@ -696,10 +730,11 @@ fn restore(args: &RestoreArgs, store: &Store) -> Result<()> {
     }
     // A manual restore of the whole snapshot is this boot's restore too:
     // auto-save may go on, and the agent has nothing left to restore. Not
-    // when it failed: a retry must find the same snapshot. The one at login
-    // runs once, whatever happens.
-    if args.auto || (failures.is_empty() && covers(&snap, &names)) {
-        store.mark_restored(&boot)?;
+    // when it failed, or left a terminal out: a retry must find the same
+    // snapshot. The one at login runs once, whatever happens.
+    let restored: Vec<String> = groups.iter().map(|(b, _)| b.name().to_string()).collect();
+    if r.auto || (failures.is_empty() && covers(r.snap, &restored)) {
+        store.mark_restored(r.boot)?;
     }
     if !failures.is_empty() {
         bail!("could not restore {}", failures.join(", "));
@@ -1042,6 +1077,224 @@ mod tests {
         let s = since(None, None, hour);
         assert_eq!(default_snapshot(&before, Some(&before), &s), Pick::Latest);
         assert_eq!(default_snapshot(&fresh, None, &s), Pick::Latest);
+    }
+
+    /// A terminal that records what a restore asks of it.
+    struct Fake {
+        name: &'static str,
+        running: bool,
+        open: usize,
+        fails: bool,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl Backend for Fake {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn display_name(&self) -> &'static str {
+            self.name
+        }
+        fn caps(&self) -> Caps {
+            Caps { splits: true }
+        }
+        fn installed(&self) -> bool {
+            true
+        }
+        fn host_pids(&self, _: &[procs::Proc]) -> Vec<i32> {
+            if self.running { vec![1] } else { Vec::new() }
+        }
+        fn read_layout(&self, _: &[procs::Proc]) -> Result<backend::RawLayout> {
+            let terminal = backend::RawTerminal {
+                id: String::new(),
+                title: String::new(),
+                cwd: String::new(),
+                tty: None,
+            };
+            Ok(backend::RawLayout {
+                windows: vec![backend::RawWindow {
+                    tabs: vec![backend::RawTab {
+                        title: String::new(),
+                        selected: true,
+                        terminals: vec![terminal; self.open],
+                    }],
+                }],
+            })
+        }
+        fn ensure_running(&self) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{}: start", self.name));
+            Ok(())
+        }
+        fn blank_windows(&self) -> Result<Vec<String>> {
+            Ok(vec!["blank".into()])
+        }
+        fn close_windows(&self, ids: &[String]) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{}: close {}", self.name, ids.join(",")));
+            Ok(())
+        }
+        fn restore_script(&self, _: &WindowPlan, _: u64) -> String {
+            String::new()
+        }
+        fn restore_window(&self, w: &WindowPlan, _: u64) -> Result<()> {
+            if self.fails {
+                bail!("did not answer");
+            }
+            self.calls.borrow_mut().push(format!(
+                "{}: window of {} tab(s)",
+                self.name,
+                w.tabs.len()
+            ));
+            Ok(())
+        }
+    }
+
+    type Calls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    fn fake(
+        name: &'static str,
+        running: bool,
+        open: usize,
+        fails: bool,
+        calls: &Calls,
+    ) -> Box<dyn Backend> {
+        Box::new(Fake {
+            name,
+            running,
+            open,
+            fails,
+            calls: calls.clone(),
+        })
+    }
+
+    fn one_window() -> Vec<WindowPlan> {
+        vec![WindowPlan {
+            tabs: vec![TabPlan {
+                selected: true,
+                panes: vec![rules::Launch {
+                    cwd: "/".into(),
+                    input: None,
+                    run: false,
+                }],
+            }],
+        }]
+    }
+
+    fn replay_with(
+        groups: &[(Box<dyn Backend>, Vec<WindowPlan>)],
+        snap: &Snapshot,
+        store: &Store,
+        (force, auto): (bool, bool),
+    ) -> Result<()> {
+        let boot = boot(2, "B");
+        let r = Replay {
+            procs: &[],
+            snap,
+            boot: &boot,
+            force,
+            auto,
+            delay_ms: 0,
+        };
+        replay(groups, &r, store, &|_| {})
+    }
+
+    #[test]
+    fn a_restore_refuses_to_duplicate_open_panes_before_touching_anything() {
+        let store = store::scratch("replay-refuse");
+        let calls = Calls::default();
+        let mut windows = win("a", "/");
+        windows.extend(win("b", "/"));
+        windows[1].backend = "busy".into();
+        windows[0].backend = "idle".into();
+        let s = snap(&boot(1, "A"), windows);
+        let groups = vec![
+            (fake("idle", true, 1, false, &calls), one_window()),
+            (fake("busy", true, 3, false, &calls), one_window()),
+        ];
+        let err = replay_with(&groups, &s, &store, (false, false)).unwrap_err();
+        assert!(
+            err.to_string().contains("busy already has 3 panes open"),
+            "{err}"
+        );
+        assert!(calls.borrow().is_empty(), "nothing was touched");
+        assert_eq!(store.restored_boot(), None);
+
+        // --force, or the restore at login, goes ahead.
+        replay_with(&groups, &s, &store, (true, false)).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "idle: start",
+                "idle: window of 1 tab(s)",
+                "idle: close ",
+                "busy: start",
+                "busy: window of 1 tab(s)",
+                "busy: close "
+            ]
+        );
+        assert_eq!(
+            store.restored_boot(),
+            Some(boot(2, "B")),
+            "the whole snapshot"
+        );
+    }
+
+    #[test]
+    fn a_failed_or_partial_restore_leaves_the_boot_unrestored() {
+        let calls = Calls::default();
+        let mut windows = win("a", "/");
+        windows.extend(win("b", "/"));
+        windows[0].backend = "ok".into();
+        windows[1].backend = "broken".into();
+        let s = snap(&boot(1, "A"), windows);
+        let groups = || {
+            vec![
+                (fake("ok", true, 0, false, &calls), one_window()),
+                (fake("broken", true, 0, true, &calls), one_window()),
+            ]
+        };
+
+        let store = store::scratch("replay-failed");
+        let err = replay_with(&groups(), &s, &store, (false, false)).unwrap_err();
+        assert!(
+            err.to_string().contains("could not restore broken"),
+            "{err}"
+        );
+        assert_eq!(
+            store.restored_boot(),
+            None,
+            "a retry finds the same snapshot"
+        );
+
+        // One terminal of two (--backend): not the whole snapshot.
+        let store = store::scratch("replay-partial");
+        replay_with(&groups()[..1], &s, &store, (false, false)).unwrap();
+        assert_eq!(store.restored_boot(), None);
+
+        // At login it runs once, whatever happens.
+        let store = store::scratch("replay-login");
+        assert!(replay_with(&groups(), &s, &store, (false, true)).is_err());
+        assert_eq!(store.restored_boot(), Some(boot(2, "B")));
+    }
+
+    #[test]
+    fn a_terminal_started_by_the_restore_loses_its_blank_window() {
+        let store = store::scratch("replay-blank");
+        let calls = Calls::default();
+        let mut w = win("a", "/");
+        w[0].backend = "cold".into();
+        let s = snap(&boot(1, "A"), w);
+        let groups = vec![(fake("cold", false, 0, false, &calls), one_window())];
+        replay_with(&groups, &s, &store, (false, false)).unwrap();
+        assert_eq!(
+            calls.borrow().last().map(String::as_str),
+            Some("cold: close blank")
+        );
+        // The lock is given back.
+        assert!(!store.restoring());
     }
 
     #[test]
