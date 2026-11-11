@@ -25,7 +25,7 @@ Every command takes `--backend ghostty|iterm2|kitty|terminal` to act on one term
 
 1. `termrevive show` (or `--snapshot <file>` from `list`) and tell the user what will open. After a reboot that was not restored yet (and for a day at most, until the user saves by hand), `show` and `restore` use the last snapshot from before the reboot (`previous-boot.json`) and print a note saying so; relay it.
 2. `termrevive restore`. It refuses when a terminal already has more than one pane open, because it would duplicate them; that includes the tab you are running in plus any other. Do not add `--force` on your own: tell the user, and let them close the extra tabs, confirm the duplication, or restore only the other terminals with `--backend`.
-3. `termrevive restore --dry-run` prints the AppleScript without running it, when the user wants to check first.
+3. `termrevive restore --dry-run` prints what would run (AppleScript, or `kitten @` commands for kitty) without running it, when the user wants to check first.
 
 Panes open one after another (`delay_ms` in the config, 300 ms by default), so a large snapshot takes a while; Agent sessions resume in their saved directory or worktree, or in the pane's directory if it is gone. Split geometry is not restored: a tab's panes come back side by side, in order. Terminal.app tabs come back as separate windows.
 
