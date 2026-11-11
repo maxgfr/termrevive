@@ -1,9 +1,12 @@
 //! Line-based `key value` / `key = value` config files (Ghostty, kitty…),
 //! read and edited without touching the lines termrevive does not own. The
-//! files they include are followed: Ghostty's `config-file`, kitty's `include`.
+//! files they include are followed: Ghostty's `config-file`, kitty's
+//! `include`, `globinclude` and `envinclude` (with termrevive's environment,
+//! which may differ from the one kitty started with). kitty's `geninclude`
+//! is not: it runs a program.
 
 use anyhow::{Context, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,33 +93,50 @@ fn included(value: &str, from: &Path, syntax: Syntax) -> Option<PathBuf> {
 /// the order they were named.
 fn assignments(files: &[PathBuf], key: &str, syntax: Syntax) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut queue: VecDeque<PathBuf> = files.iter().cloned().collect();
-    while let Some(file) = queue.pop_front() {
-        let later = visit(&file, key, syntax, &mut seen, &mut out);
+    let mut trail = Trail::default();
+    let mut queue: VecDeque<Later> = files.iter().map(|f| (f.clone(), Vec::new())).collect();
+    while let Some((file, ancestors)) = queue.pop_front() {
+        trail.ancestors = ancestors;
+        let later = visit(&file, key, syntax, &mut trail, &mut out);
         queue.extend(later);
     }
     out
 }
+
+/// Where a read is in the include tree.
+#[derive(Default)]
+struct Trail {
+    /// The files that include the one being read: including one of them
+    /// again is a cycle, cut there. A file included twice elsewhere is read
+    /// twice, as the terminals do.
+    ancestors: Vec<PathBuf>,
+    /// Files read so far, capped in case of a runaway tree.
+    reads: usize,
+}
+
+/// A file read later, with the files that include it.
+type Later = (PathBuf, Vec<PathBuf>);
 
 /// Reads `file` into `out`; returns the files it includes that are read later.
 fn visit(
     file: &Path,
     key: &str,
     syntax: Syntax,
-    seen: &mut HashSet<PathBuf>,
+    trail: &mut Trail,
     out: &mut Vec<(PathBuf, String)>,
-) -> Vec<PathBuf> {
-    // A file included twice, or a cycle, is read once.
+) -> Vec<Later> {
     let id = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let mut later = Vec::new();
-    if seen.len() > 64 || !seen.insert(id) {
+    if trail.reads >= 256 || trail.ancestors.contains(&id) {
         return later;
     }
     let Ok(text) = fs::read_to_string(file) else {
         return later;
     };
-    read_lines(&text, file, key, syntax, seen, out, &mut later);
+    trail.reads += 1;
+    trail.ancestors.push(id);
+    read_lines(&text, file, key, syntax, trail, out, &mut later);
+    trail.ancestors.pop();
     later
 }
 
@@ -126,9 +146,9 @@ fn read_lines(
     file: &Path,
     key: &str,
     syntax: Syntax,
-    seen: &mut HashSet<PathBuf>,
+    trail: &mut Trail,
     out: &mut Vec<(PathBuf, String)>,
-    later: &mut Vec<PathBuf>,
+    later: &mut Vec<Later>,
 ) {
     for l in text.lines() {
         let Some((k, v)) = split(l, syntax) else {
@@ -143,10 +163,12 @@ fn read_lines(
             continue;
         }
         match (syntax, k) {
-            (Syntax::Equals, "config-file") => later.extend(included(v, file, syntax)),
+            (Syntax::Equals, "config-file") => {
+                later.extend(included(v, file, syntax).map(|inc| (inc, trail.ancestors.clone())))
+            }
             (Syntax::Space, "include") => {
                 if let Some(inc) = included(v, file, syntax) {
-                    later.extend(visit(&inc, key, syntax, seen, out));
+                    later.extend(visit(&inc, key, syntax, trail, out));
                 }
             }
             // Every file matching a pattern, in order of name.
@@ -155,7 +177,7 @@ fn read_lines(
                     .map(|p| glob(&p))
                     .unwrap_or_default()
                 {
-                    later.extend(visit(&inc, key, syntax, seen, out));
+                    later.extend(visit(&inc, key, syntax, trail, out));
                 }
             }
             // The contents of every variable whose name matches, in order of
@@ -166,7 +188,7 @@ fn read_lines(
                     .collect();
                 vars.sort();
                 for (_, text) in vars {
-                    read_lines(&text, file, key, syntax, seen, out, later);
+                    read_lines(&text, file, key, syntax, trail, out, later);
                 }
             }
             // `geninclude` runs a program to produce its lines: doctor does
@@ -226,7 +248,8 @@ fn walk(dir: &Path, pattern: &[String], out: &mut Vec<PathBuf>) {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        // Hidden files only match a pattern that names them, as in a shell.
+        if name.starts_with('.') && !first.starts_with('.') {
             continue;
         }
         let path = e.path();
@@ -415,6 +438,29 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(all, ["unix:/0", "unix:/a", "unix:/b"]);
+        // Included twice (not a cycle): read twice, the second one winning.
+        write(
+            "twice.conf",
+            "include kitty.d/a.conf\nlisten_on unix:/t\ninclude kitty.d/a.conf\n",
+        );
+        let files = [dir.join("twice.conf")];
+        assert_eq!(
+            read_key(&files, "listen_on", Syntax::Space).as_deref(),
+            Some("unix:/a")
+        );
+        // A hidden file only matches a pattern that starts with a dot.
+        write("kitty.d/.hidden.conf", "listen_on unix:/h\n");
+        write("hidden.conf", "globinclude kitty.d/*.conf\n");
+        let files = [dir.join("hidden.conf")];
+        assert_eq!(
+            read_key(&files, "listen_on", Syntax::Space).as_deref(),
+            Some("unix:/a")
+        );
+        write("hidden.conf", "globinclude kitty.d/.*.conf\n");
+        assert_eq!(
+            read_key(&files, "listen_on", Syntax::Space).as_deref(),
+            Some("unix:/h")
+        );
         // An environment include: HOME is set in every test run.
         write("env.conf", "allow_remote_control no\nenvinclude HOM?\n");
         let files = [dir.join("env.conf")];
